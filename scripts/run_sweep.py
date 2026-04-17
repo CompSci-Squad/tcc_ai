@@ -32,19 +32,30 @@ from tcc_itransformer.data.preprocessing import (
     scale_splits,
     split_by_date,
 )
+from tcc_itransformer.evaluation.baselines import run_all_baselines
 from tcc_itransformer.evaluation.clustering import (
     apply_pca,
+    clustering_stability,
     compute_clustering_metrics,
+    compute_regime_transitions,
     fit_adaptive_pca,
     fit_kmeans,
+    select_k,
 )
 from tcc_itransformer.evaluation.effective_sample_size import (
+    compute_effective_n,
     extract_non_overlapping_indices,
 )
 from tcc_itransformer.evaluation.embedding_quality import (
     check_embedding_collapse,
     compute_effective_rank,
     compute_isotropy,
+)
+from tcc_itransformer.evaluation.statistical_tests import (
+    kruskal_wallis_per_dim,
+    moving_block_bootstrap,
+    pairwise_mann_whitney,
+    permutation_test_silhouette,
 )
 from tcc_itransformer.model.autoencoder import iTransformerAE
 from tcc_itransformer.seed import set_global_seed
@@ -142,13 +153,15 @@ def main() -> None:
         # Windows for this window size
         tw = create_windows(train_scaled, w)
         vw = create_windows(val_scaled, w)
-        _testw = create_windows(test_scaled, w)
+        testw = create_windows(test_scaled, w)
 
         train_ds = FREDMDWindowDataset(tw)
         val_ds = FREDMDWindowDataset(vw)
+        test_ds = FREDMDWindowDataset(testw)
 
         train_loader = DataLoader(train_ds, batch_size=train_config.batch_size, shuffle=True)
         val_loader = DataLoader(val_ds, batch_size=train_config.batch_size, shuffle=False)
+        test_loader = DataLoader(test_ds, batch_size=train_config.batch_size, shuffle=False)
 
         # Train model once per (W, d)
         model = iTransformerAE.from_config(train_config, n_series)
@@ -156,16 +169,21 @@ def main() -> None:
         history = trainer.train()
         trainer.checkpoint.load_best(model)
 
-        # Extract embeddings
+        # Extract embeddings (all splits)
         train_emb = trainer.extract_embeddings(train_loader)
         val_emb = trainer.extract_embeddings(val_loader)
+        test_emb = trainer.extract_embeddings(test_loader)
 
-        # Embedding quality
+        # Embedding quality (shared across K values)
         collapse_info = check_embedding_collapse(train_emb)
         eff_rank = compute_effective_rank(train_emb)
         isotropy = compute_isotropy(train_emb)
 
-        # PCA
+        # Effective sample sizes
+        n_eff_train = compute_effective_n(len(train_emb), w)
+        n_eff_test = compute_effective_n(len(test_emb), w)
+
+        # PCA on non-overlapping train
         non_overlap_idx = extract_non_overlapping_indices(n_windows=len(train_emb), window_size=w)
         train_emb_no = train_emb[non_overlap_idx]
         pca, n_pca = fit_adaptive_pca(
@@ -174,8 +192,15 @@ def main() -> None:
             variance_threshold=train_config.pca_variance_threshold,
             n_max=train_config.n_pca_max,
         )
+        pca_var_explained = float(np.sum(pca.explained_variance_ratio_))
         train_pca = apply_pca(train_emb_no, pca)
 
+        # Test set non-overlapping
+        test_no_idx = extract_non_overlapping_indices(n_windows=len(test_emb), window_size=w)
+        test_emb_no = test_emb[test_no_idx]
+        test_pca = apply_pca(test_emb_no, pca)
+
+        # Val set non-overlapping
         val_no_idx = extract_non_overlapping_indices(n_windows=len(val_emb), window_size=w)
         val_emb_no = val_emb[val_no_idx]
         val_pca = apply_pca(val_emb_no, pca)
@@ -188,11 +213,19 @@ def main() -> None:
             run_name = f"W{w}_d{d}_K{k}"
 
             km = fit_kmeans(train_pca, k, random_state=config.seed)
+            test_labels = km.predict(test_pca)
+            test_cluster_metrics = compute_clustering_metrics(test_pca, test_labels)
+
             val_labels = km.predict(val_pca)
-            cluster_metrics = compute_clustering_metrics(val_pca, val_labels)
+            val_cluster_metrics = compute_clustering_metrics(val_pca, val_labels)
 
             with mlflow.start_run(experiment_id=experiment_id, run_name=run_name):
                 log_config(config)
+
+                # W=24 exploratory labeling
+                if w == 24:
+                    mlflow.set_tag("analysis_type", "exploratory")
+                    mlflow.set_tag("power_warning", "W=24: n_eff too low for inference")
 
                 for epoch, (tl, vl) in enumerate(
                     zip(history["train_losses"], history["val_losses"]),
@@ -204,19 +237,82 @@ def main() -> None:
                     "effective_rank": eff_rank,
                     "isotropy": isotropy,
                     "n_pca_components": float(n_pca),
+                    "pca_variance_explained": pca_var_explained,
+                    "n_eff_train": float(n_eff_train),
+                    "n_eff_test": float(n_eff_test),
                     "best_epoch": float(history["best_epoch"]),
                     "stopped_epoch": float(history["stopped_epoch"]),
                     "final_train_loss": history["train_losses"][-1],
                     "final_val_loss": history["val_losses"][-1],
                     "best_val_loss": float(min(history["val_losses"])),
+                    "clustering_stability_ari": clustering_stability(
+                        train_pca, k, n_runs=5, random_state=config.seed,
+                    ),
+                    "test_regime_transitions": float(compute_regime_transitions(test_labels)),
                 }
 
-                for metric_name, metric_val in cluster_metrics.items():
-                    eval_metrics[metric_name] = metric_val
+                # Test metrics
+                for metric_name, metric_val in test_cluster_metrics.items():
+                    eval_metrics[f"test_{metric_name}"] = metric_val
+
+                # Val metrics
+                for metric_name, metric_val in val_cluster_metrics.items():
+                    eval_metrics[f"val_{metric_name}"] = metric_val
+
+                # Statistical tests on test set
+                if len(test_pca) >= 3 and len(np.unique(test_labels)) >= 2:
+                    kw = kruskal_wallis_per_dim(test_pca, test_labels)
+                    eval_metrics["kw_n_significant"] = float(kw["n_significant"])
+                    eval_metrics["kw_mean_effect_size"] = float(np.mean(kw["effect_sizes"]))
+
+                    mw = pairwise_mann_whitney(test_pca, test_labels)
+                    eval_metrics["mw_mean_effect_size"] = float(np.mean(np.abs(mw["effect_sizes"])))
+
+                # Baselines with permutation test
+                baseline_results = run_all_baselines(
+                    train_windows=tw,
+                    eval_windows=testw[test_no_idx] if len(testw.shape) >= 2 else testw,
+                    n_components=n_pca,
+                    k=k,
+                    random_state=config.seed,
+                )
+                for bname, bresult in baseline_results.items():
+                    eval_metrics[f"baseline_{bname}_silhouette"] = bresult["silhouette"]
+
+                if "raw_pca" in baseline_results and len(test_pca) >= 3:
+                    perm = permutation_test_silhouette(
+                        test_pca, test_labels,
+                        baseline_results["raw_pca"]["embeddings"],
+                        baseline_results["raw_pca"]["labels"],
+                        n_permutations=10000, random_state=config.seed,
+                    )
+                    eval_metrics["perm_delta_silhouette"] = perm["observed_diff"]
+                    eval_metrics["perm_p_value"] = perm["p_value"]
+
+                # Block bootstrap CI for silhouette (when n_eff sufficient)
+                if n_eff_test >= 20 and len(test_pca) >= 3:
+                    from sklearn.metrics import silhouette_score
+
+                    def _sil_stat(data: np.ndarray) -> float:
+                        _km = fit_kmeans(data, k, random_state=config.seed)
+                        _labels = _km.predict(data)
+                        if len(np.unique(_labels)) < 2:
+                            return float("nan")
+                        return float(silhouette_score(data, _labels))
+
+                    boot = moving_block_bootstrap(
+                        statistic_fn=_sil_stat,
+                        data=test_pca,
+                        block_length=max(1, w // 2),
+                        n_bootstrap=2000,
+                        random_state=config.seed,
+                    )
+                    eval_metrics["bootstrap_silhouette_ci_lower"] = boot["ci_lower"]
+                    eval_metrics["bootstrap_silhouette_ci_upper"] = boot["ci_upper"]
 
                 log_evaluation_metrics(eval_metrics)
 
-            logger.info("Logged run %s: silhouette=%.4f", run_name, cluster_metrics["silhouette"])
+            logger.info("Logged run %s: test_silhouette=%.4f", run_name, test_cluster_metrics["silhouette"])
 
     logger.info("Sweep complete.")
 

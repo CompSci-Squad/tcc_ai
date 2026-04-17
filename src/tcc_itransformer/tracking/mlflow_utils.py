@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 
 import mlflow
@@ -10,6 +11,20 @@ import mlflow
 from tcc_itransformer.config import ExperimentConfig
 
 logger = logging.getLogger(__name__)
+
+
+def get_git_commit() -> str:
+    """Return current git commit hash or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
 
 
 def setup_mlflow(tracking_uri: str, experiment_name: str) -> str:
@@ -38,12 +53,13 @@ def setup_mlflow(tracking_uri: str, experiment_name: str) -> str:
 
 
 def log_config(config: ExperimentConfig) -> None:
-    """Log all config parameters to the active MLflow run.
+    """Log all config parameters and git commit to the active MLflow run.
 
     Args:
         config: Experiment configuration to log.
     """
     mlflow.log_params(config.model_dump_for_mlflow())
+    mlflow.set_tag("git_commit", get_git_commit())
 
 
 def log_epoch_metrics(epoch: int, train_loss: float, val_loss: float) -> None:

@@ -14,6 +14,7 @@ from tcc_itransformer.data.fred_md import (
     load_fred_md,
     remove_outliers,
     transform_panel,
+    verify_sha256,
 )
 
 # ---------------------------------------------------------------------------
@@ -183,3 +184,32 @@ class TestTransformPanel:
         assert result.shape[0] < data.shape[0]
         # No all-NaN rows at the start
         assert result.iloc[0].notna().all()
+
+
+class TestVerifySHA256:
+    def test_matching_hash(self, tmp_path: Path) -> None:
+        import hashlib
+
+        csv_path = tmp_path / "data.csv"
+        csv_path.write_text("col1,col2\n1,2\n3,4\n")
+        expected = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+        hash_path = tmp_path / "data.sha256"
+        hash_path.write_text(expected)
+        assert verify_sha256(csv_path, hash_path) is True
+
+    def test_mismatched_hash(self, tmp_path: Path) -> None:
+        csv_path = tmp_path / "data.csv"
+        csv_path.write_text("col1,col2\n1,2\n3,4\n")
+        hash_path = tmp_path / "data.sha256"
+        hash_path.write_text("0" * 64)
+        assert verify_sha256(csv_path, hash_path) is False
+
+    def test_case_insensitive(self, tmp_path: Path) -> None:
+        import hashlib
+
+        csv_path = tmp_path / "data.csv"
+        csv_path.write_text("hello\n")
+        expected = hashlib.sha256(csv_path.read_bytes()).hexdigest().upper()
+        hash_path = tmp_path / "data.sha256"
+        hash_path.write_text(expected)
+        assert verify_sha256(csv_path, hash_path) is True

@@ -8,6 +8,7 @@ import pytest
 from tcc_itransformer.evaluation.clustering import (
     clustering_stability,
     compute_clustering_metrics,
+    compute_regime_transitions,
     fit_adaptive_pca,
     fit_kmeans,
     select_k,
@@ -95,3 +96,25 @@ class TestClusteringStability:
         data, _ = clustered_embeddings
         ari = clustering_stability(data, k=3, n_runs=5)
         assert 0 <= ari <= 1
+
+
+class TestComputeRegimeTransitions:
+    def test_no_transitions(self) -> None:
+        labels = np.array([0, 0, 0, 0, 0])
+        assert compute_regime_transitions(labels) == 0
+
+    def test_all_transitions(self) -> None:
+        labels = np.array([0, 1, 0, 1, 0])
+        assert compute_regime_transitions(labels) == 4
+
+    def test_known_count(self) -> None:
+        labels = np.array([0, 0, 1, 1, 2, 2, 0])
+        assert compute_regime_transitions(labels) == 3
+
+    def test_single_element(self) -> None:
+        labels = np.array([1])
+        assert compute_regime_transitions(labels) == 0
+
+    def test_empty(self) -> None:
+        labels = np.array([], dtype=int)
+        assert compute_regime_transitions(labels) == 0

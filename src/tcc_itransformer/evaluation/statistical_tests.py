@@ -2,14 +2,98 @@
 
 from __future__ import annotations
 
+import logging
 import math
+import warnings
 from collections.abc import Callable
 from itertools import combinations
 
 import numpy as np
-from scipy.stats import kruskal, mannwhitneyu
+from scipy.stats import kruskal, mannwhitneyu, norm
 from sklearn.metrics import silhouette_score
 from statsmodels.stats.multitest import multipletests
+
+logger = logging.getLogger(__name__)
+
+MIN_BOOTSTRAP_N_EFF = 20
+
+
+def _bootstrap_ci(
+    data: np.ndarray,
+    statistic_fn: Callable[[np.ndarray], float],
+    n_bootstrap: int = 5000,
+    confidence_level: float = 0.95,
+    random_state: int = 42,
+) -> tuple[float, float]:
+    """Compute BCa bootstrap confidence interval for a statistic.
+
+    Falls back to percentile method if BCa computation fails.
+    """
+    rng = np.random.default_rng(random_state)
+    n = len(data)
+    theta_hat = statistic_fn(data)
+
+    # Bootstrap distribution
+    boot_dist = np.zeros(n_bootstrap)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        boot_dist[i] = statistic_fn(data[idx])
+
+    # BCa: bias correction
+    z0 = norm.ppf(np.mean(boot_dist < theta_hat))
+
+    if not np.isfinite(z0):
+        # Fall back to percentile
+        alpha = 1.0 - confidence_level
+        return (
+            float(np.percentile(boot_dist, 100 * alpha / 2)),
+            float(np.percentile(boot_dist, 100 * (1 - alpha / 2))),
+        )
+
+    # BCa: acceleration via jackknife
+    jack_vals = np.zeros(n)
+    for i in range(n):
+        jack_sample = np.delete(data, i, axis=0)
+        jack_vals[i] = statistic_fn(jack_sample)
+    jack_mean = jack_vals.mean()
+    num = np.sum((jack_mean - jack_vals) ** 3)
+    den = 6.0 * (np.sum((jack_mean - jack_vals) ** 2) ** 1.5)
+
+    if den == 0:
+        # Fall back to percentile
+        alpha = 1.0 - confidence_level
+        return (
+            float(np.percentile(boot_dist, 100 * alpha / 2)),
+            float(np.percentile(boot_dist, 100 * (1 - alpha / 2))),
+        )
+
+    a = num / den
+
+    alpha = 1.0 - confidence_level
+    z_alpha_lower = norm.ppf(alpha / 2)
+    z_alpha_upper = norm.ppf(1 - alpha / 2)
+
+    # BCa adjusted percentiles
+    def _bca_percentile(z_alpha: float) -> float:
+        numerator = z0 + z_alpha
+        adjusted = z0 + numerator / (1 - a * numerator)
+        return float(norm.cdf(adjusted) * 100)
+
+    p_lower = _bca_percentile(z_alpha_lower)
+    p_upper = _bca_percentile(z_alpha_upper)
+
+    if not (np.isfinite(p_lower) and np.isfinite(p_upper)):
+        alpha = 1.0 - confidence_level
+        p_lower = 100 * alpha / 2
+        p_upper = 100 * (1 - alpha / 2)
+
+    p_lower = np.clip(p_lower, 0.5, 99.5)
+    p_upper = np.clip(p_upper, 0.5, 99.5)
+
+    return (
+        float(np.percentile(boot_dist, p_lower)),
+        float(np.percentile(boot_dist, p_upper)),
+    )
 
 
 def kruskal_wallis_per_dim(
@@ -52,6 +136,30 @@ def kruskal_wallis_per_dim(
     else:
         effect_sizes = np.zeros(n_dims)
 
+    # Bootstrap CIs for effect sizes per dimension
+    effect_size_cis = np.zeros((n_dims, 2))
+    for d in range(n_dims):
+        # Stack dim values and labels so bootstrap resamples rows together
+        dim_data_with_labels = np.column_stack([embeddings[:, d], labels])
+
+        def _eta_h_for_dim(paired: np.ndarray) -> float:
+            vals, lbls = paired[:, 0], paired[:, 1]
+            groups = [vals[lbls == lbl] for lbl in unique_labels]
+            groups = [g for g in groups if len(g) > 0]
+            if len(groups) < 2:
+                return 0.0
+            h, _ = kruskal(*groups)
+            denom = len(vals) - len(unique_labels)
+            if denom <= 0:
+                return 0.0
+            return float(np.clip((h - len(unique_labels) + 1) / denom, 0.0, 1.0))
+
+        if n_samples >= MIN_BOOTSTRAP_N_EFF:
+            ci = _bootstrap_ci(dim_data_with_labels, _eta_h_for_dim, n_bootstrap=2000, random_state=42 + d)
+            effect_size_cis[d] = ci
+        else:
+            effect_size_cis[d] = [np.nan, np.nan]
+
     return {
         "h_stats": h_stats,
         "p_values_raw": p_values_raw,
@@ -59,6 +167,7 @@ def kruskal_wallis_per_dim(
         "rejected": rejected,
         "n_significant": int(np.sum(rejected)),
         "effect_sizes": effect_sizes,
+        "effect_size_cis": effect_size_cis,
     }
 
 
@@ -103,12 +212,35 @@ def pairwise_mann_whitney(
     _, p_corrected_flat, _, _ = multipletests(p_flat, method="fdr_bh")
     p_corrected = p_corrected_flat.reshape(n_pairs, n_dims)
 
+    # Bootstrap CIs for rank-biserial per (pair, dim)
+    effect_size_cis = np.full((n_pairs, n_dims, 2), np.nan)
+    for pi, (la, lb) in enumerate(pairs):
+        group_a = embeddings[labels == la]
+        group_b = embeddings[labels == lb]
+        n1, n2 = len(group_a), len(group_b)
+        if n1 + n2 >= MIN_BOOTSTRAP_N_EFF:
+            for d in range(n_dims):
+                combined = np.concatenate([group_a[:, d], group_b[:, d]])
+                _n1 = n1
+
+                def _rb(data: np.ndarray, _n1: int = _n1) -> float:
+                    a_d = data[:_n1]
+                    b_d = data[_n1:]
+                    if len(a_d) == 0 or len(b_d) == 0:
+                        return 0.0
+                    u, _ = mannwhitneyu(a_d, b_d, alternative="two-sided")
+                    return float(1.0 - (2.0 * u) / (len(a_d) * len(b_d)))
+
+                ci = _bootstrap_ci(combined, _rb, n_bootstrap=2000, random_state=42 + pi * n_dims + d)
+                effect_size_cis[pi, d] = ci
+
     return {
         "pairs": pairs,
         "u_stats": u_stats,
         "p_values_raw": p_values_raw,
         "p_values_corrected": p_corrected,
         "effect_sizes": effect_sizes,
+        "effect_size_cis": effect_size_cis,
     }
 
 
@@ -155,9 +287,17 @@ def permutation_test_silhouette(
             null_distribution[i] = 0.0
 
     p_value = float(np.mean(null_distribution >= observed_diff))
+
+    # Bootstrap CI for Δ_silhouette
+    all_diffs = np.concatenate([[observed_diff], null_distribution])
+    ci_lower = float(np.percentile(null_distribution, 2.5))
+    ci_upper = float(np.percentile(null_distribution, 97.5))
+
     return {
         "observed_diff": observed_diff,
         "p_value": p_value,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
         "null_distribution": null_distribution,
     }
 
@@ -172,12 +312,19 @@ def moving_block_bootstrap(
 ) -> dict:
     """Moving block bootstrap for temporally correlated data.
 
-    Uses the percentile method for confidence intervals.
+    Uses BCa (bias-corrected and accelerated) method for confidence intervals.
+    Falls back to percentile method if BCa computation fails.
 
     Returns:
         Dictionary with point estimate, CI bounds, and bootstrap distribution.
     """
     n = len(data)
+    if n < MIN_BOOTSTRAP_N_EFF:
+        logger.warning(
+            "n_eff=%d < %d: bootstrap CIs may be unreliable",
+            n, MIN_BOOTSTRAP_N_EFF,
+        )
+
     rng = np.random.default_rng(random_state)
     estimate = float(statistic_fn(data))
 
@@ -191,9 +338,37 @@ def moving_block_bootstrap(
         sample = np.concatenate(blocks)[:n]
         bootstrap_dist[i] = statistic_fn(sample)
 
+    # BCa bias correction
+    z0 = norm.ppf(np.mean(bootstrap_dist < estimate))
+
+    # BCa acceleration via jackknife (block-delete)
+    jack_vals = np.zeros(n)
+    for i in range(n):
+        jack_sample = np.delete(data, i, axis=0)
+        jack_vals[i] = statistic_fn(jack_sample)
+    jack_mean = jack_vals.mean()
+    num = np.sum((jack_mean - jack_vals) ** 3)
+    den = 6.0 * (np.sum((jack_mean - jack_vals) ** 2) ** 1.5)
+
     alpha = 1.0 - confidence_level
-    ci_lower = float(np.percentile(bootstrap_dist, 100 * alpha / 2))
-    ci_upper = float(np.percentile(bootstrap_dist, 100 * (1 - alpha / 2)))
+
+    if den == 0 or not np.isfinite(z0):
+        # Fallback to percentile
+        ci_lower = float(np.percentile(bootstrap_dist, 100 * alpha / 2))
+        ci_upper = float(np.percentile(bootstrap_dist, 100 * (1 - alpha / 2)))
+    else:
+        a = num / den
+        z_lo = norm.ppf(alpha / 2)
+        z_hi = norm.ppf(1 - alpha / 2)
+
+        def _adj(z_a: float) -> float:
+            num_ = z0 + z_a
+            return float(norm.cdf(z0 + num_ / (1 - a * num_)) * 100)
+
+        p_lo = np.clip(_adj(z_lo), 0.5, 99.5)
+        p_hi = np.clip(_adj(z_hi), 0.5, 99.5)
+        ci_lower = float(np.percentile(bootstrap_dist, p_lo))
+        ci_upper = float(np.percentile(bootstrap_dist, p_hi))
 
     return {
         "estimate": estimate,

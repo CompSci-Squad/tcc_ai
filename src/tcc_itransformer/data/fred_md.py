@@ -47,6 +47,14 @@ def load_fred_md(path: str | Path) -> tuple[pd.DataFrame, pd.Series]:
         msg = f"FRED-MD CSV not found: {path}"
         raise FileNotFoundError(msg)
 
+    # Verify SHA-256 integrity if hash file exists
+    hash_path = path.with_suffix(".sha256")
+    if hash_path.exists():
+        if not verify_sha256(path, hash_path):
+            msg = f"SHA-256 verification failed for {path}"
+            raise ValueError(msg)
+        logger.info("SHA-256 verified for %s", path.name)
+
     raw = pd.read_csv(path, header=0)
 
     # --- Extract tcodes from row 0 of the body (row 2 of the file) ---

@@ -39,11 +39,11 @@ from tcc_itransformer.training.trainer import Trainer
 # Small dimensions for fast CPU execution
 N_SERIES = 10
 WINDOW_SIZE = 6
-D_MODEL = 16
+D_MODEL = 32
 N_HEADS = 4
 N_LAYERS = 1
-LATENT_DIM = 4
-BATCH_SIZE = 4
+LATENT_DIM = 6
+BATCH_SIZE = 8
 MAX_EPOCHS = 3
 K = 3
 

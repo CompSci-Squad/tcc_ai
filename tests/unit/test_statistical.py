@@ -154,3 +154,63 @@ class TestMovingBlockBootstrap:
         )
         assert result["ci_lower"] <= true_mean <= result["ci_upper"]
         assert result["bootstrap_distribution"].shape == (2000,)
+
+    def test_ci_lower_less_than_upper(self, rng: np.random.Generator) -> None:
+        data = rng.standard_normal(100)
+        result = moving_block_bootstrap(
+            statistic_fn=lambda x: float(np.mean(x)),
+            data=data,
+            block_length=3,
+            n_bootstrap=1000,
+        )
+        assert result["ci_lower"] <= result["ci_upper"]
+
+    def test_estimate_matches_statistic(self, rng: np.random.Generator) -> None:
+        data = rng.standard_normal(50)
+        expected = float(np.mean(data))
+        result = moving_block_bootstrap(
+            statistic_fn=lambda x: float(np.mean(x)),
+            data=data,
+            block_length=2,
+            n_bootstrap=500,
+        )
+        assert result["estimate"] == pytest.approx(expected, abs=1e-10)
+
+
+class TestEffectSizeCIs:
+    def test_kw_effect_size_cis(self, separated_data: tuple[np.ndarray, np.ndarray]) -> None:
+        data, labels = separated_data
+        result = kruskal_wallis_per_dim(data, labels)
+        assert "effect_size_cis" in result
+        cis = result["effect_size_cis"]
+        assert cis.shape == (4, 2)  # (n_dims, [lo, hi])
+        # CI lower <= point estimate <= CI upper for each dim
+        for d in range(4):
+            assert cis[d, 0] <= result["effect_sizes"][d] + 0.01  # small tolerance
+            assert cis[d, 1] >= result["effect_sizes"][d] - 0.01
+
+    def test_mw_effect_size_cis(self, separated_data: tuple[np.ndarray, np.ndarray]) -> None:
+        data, labels = separated_data
+        result = pairwise_mann_whitney(data, labels)
+        assert "effect_size_cis" in result
+        cis = result["effect_size_cis"]
+        n_pairs = len(result["pairs"])
+        assert cis.shape == (n_pairs, 4, 2)  # (pairs, dims, [lo, hi])
+
+    def test_permutation_test_has_ci(self, rng: np.random.Generator) -> None:
+        from sklearn.cluster import KMeans
+
+        emb_a = np.vstack([
+            rng.normal(loc=10, scale=0.1, size=(15, 4)),
+            rng.normal(loc=-10, scale=0.1, size=(15, 4)),
+        ])
+        labels_a = np.repeat([0, 1], 15)
+        emb_b = rng.standard_normal((30, 4))
+        km = KMeans(n_clusters=2, n_init=10, random_state=42)
+        labels_b = km.fit_predict(emb_b)
+        result = permutation_test_silhouette(
+            emb_a, labels_a, emb_b, labels_b, n_permutations=200,
+        )
+        assert "ci_lower" in result
+        assert "ci_upper" in result
+        assert result["ci_lower"] <= result["ci_upper"]

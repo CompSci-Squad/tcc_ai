@@ -62,6 +62,11 @@ class ExperimentConfig(BaseModel):
                 f"Got d_model % n_heads = {self.d_model % self.n_heads}."
             )
             raise ValueError(msg)
+        if self.latent_dim > self.d_model:
+            msg = (
+                f"latent_dim ({self.latent_dim}) must be <= d_model ({self.d_model})."
+            )
+            raise ValueError(msg)
         return self
 
     @classmethod

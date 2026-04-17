@@ -125,3 +125,13 @@ def clustering_stability(
         for i, j in combinations(range(n_runs), 2)
     ]
     return float(np.mean(aris))
+
+
+def compute_regime_transitions(labels: np.ndarray) -> int:
+    """Count the number of regime transitions between consecutive labels.
+
+    A transition occurs when ``labels[i] != labels[i-1]``.
+    """
+    if len(labels) < 2:
+        return 0
+    return int(np.sum(labels[1:] != labels[:-1]))

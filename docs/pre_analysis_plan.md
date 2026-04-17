@@ -40,3 +40,40 @@ A contiguous temporal interval during which macroeconomic indicators exhibit
 statistically homogeneous dynamics, as measured by cluster membership stability
 over consecutive non-overlapping windows. Regimes are validated qualitatively
 against NBER recession dates and ICSS structural breakpoints.
+
+### Success / Failure Criteria
+
+| Criterion | Threshold | Action if failed |
+|-----------|-----------|-----------------|
+| Silhouette (primary config, test) | > 0 | Report as null finding |
+| Permutation test p-value | < 0.05 | Report as null finding |
+| Effective rank of embeddings | > 2.0 | Investigate collapse |
+| PCA variance explained (train) | ≥ 90% | Increase n_pca_max |
+| Clustering stability ARI | > 0.7 | Report instability |
+| KW significant dims (≥ d/2) | BH p < 0.05 | Report as weak separation |
+
+### Quality Gates
+Before reporting any configuration's results:
+1. Embedding collapse check: per-dimension variance > 1e-4
+2. Reconstruction loss beats naive baseline (mean-prediction MSE)
+3. Effective sample size ≥ 20 for bootstrap CIs; otherwise report point estimate only
+4. W=24 analyses always tagged `analysis_type=exploratory` with power warning
+
+### Data Exclusion Criteria
+- Series with > 10% missing values after stationarity transforms are excluded
+- Windows containing any NaN after preprocessing are dropped
+- No post-hoc exclusion of configurations with unfavorable results
+
+### Reporting Commitment
+All results are reported, including null findings and failed quality gates.
+Negative results are given equal space as positive results.
+
+### Sample Size Justification
+The FRED-MD dataset provides ~770 monthly observations (1959–2024). After
+train/val/test split and non-overlapping windowing:
+- W=6 train: ~70 non-overlapping windows
+- W=12 train: ~35 non-overlapping windows
+- W=24 train: ~17 non-overlapping windows
+
+Power for non-parametric tests is limited, especially for W=24. We acknowledge
+this limitation explicitly and use block bootstrap where feasible.
