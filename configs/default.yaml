@@ -1,0 +1,38 @@
+# Default experiment configuration
+# W=12, d_latent=8, K=4, d_model=64
+
+seed: 42
+
+# Architecture
+window_size: 12
+latent_dim: 8
+d_model: 64
+n_heads: 4
+n_layers: 2
+dropout: 0.1
+
+# Clustering
+n_clusters: 4
+
+# Training
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+max_epochs: 200
+patience: 10
+grad_clip: 1.0
+
+# PCA
+pca_variance_threshold: 0.9
+n_pca_max: 5
+
+# Data splits
+train_end: "2018-12-01"
+val_end: "2021-12-01"
+
+# Paths
+data_path: "data/snapshots/fred_md_2026_04.csv"
+results_dir: "results"
+
+# MLflow
+experiment_name: "itransformer-autoencoder"
