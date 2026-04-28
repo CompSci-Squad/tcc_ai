@@ -1,0 +1,37 @@
+seed: 42
+window_size: 24
+latent_dim: 7
+d_model: 64
+n_heads: 4
+n_layers: 2
+dropout: 0.1
+n_clusters: 3
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+max_epochs: 200
+patience: 10
+grad_clip: 1.0
+pca_variance_threshold: 0.9
+n_pca_max: 5
+umap_n_components: 5
+umap_n_neighbors: 15
+umap_min_dist: 0.0
+hdbscan_min_cluster_sizes:
+- 5
+- 8
+- 10
+- 15
+- 20
+hdbscan_min_samples_grid:
+- null
+- 1
+- 5
+hdbscan_max_noise_fraction: 0.5
+nber_usrec_path: data/snapshots/nber_usrec.csv
+explain_top_k: 5
+train_end: '2018-12-01'
+val_end: '2021-12-01'
+data_path: data/snapshots/fred_md_2026_04.csv
+results_dir: results
+experiment_name: sweep-W24-d7-K3

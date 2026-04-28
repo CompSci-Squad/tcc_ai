@@ -1,4 +1,15 @@
-.PHONY: train sweep test lint ui baselines export install clean download-data generate-sweep help reproduce
+.PHONY: train sweep test lint ui baselines export install clean download-data generate-sweep help reproduce pull-nber sm-build sm-push sm-train sm-sweep
+
+# AWS / SageMaker variables (override on CLI: make sm-build AWS_ACCOUNT=...)
+AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
+AWS_REGION  ?= us-east-1
+ECR_REPO    ?= tcc-itransformer
+IMAGE_TAG   ?= latest
+IMAGE_URI   := $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPO):$(IMAGE_TAG)
+SM_BUCKET   ?= tcc-regime-etl-sagemaker
+SM_ROLE     ?= arn:aws:iam::$(AWS_ACCOUNT):role/SageMakerExecRole
+SM_INSTANCE ?= ml.g4dn.xlarge
+MLFLOW_URI  ?=
 
 # Install all dependencies
 install:
@@ -7,6 +18,10 @@ install:
 # Download FRED-MD data snapshot with SHA-256 verification
 download-data:
 	uv run python scripts/download_data.py
+
+# Pull NBER USREC recession indicator snapshot
+pull-nber:
+	uv run python scripts/pull_nber.py
 
 # Generate 36 sweep configuration YAML files
 generate-sweep:
@@ -64,6 +79,47 @@ clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
+# ---------------- SageMaker / AWS ----------------
+# Build training image locally
+sm-build:
+	docker build -f Dockerfile -t $(ECR_REPO):$(IMAGE_TAG) .
+
+# Push training image to ECR (creates repo if missing, logs into both registries)
+sm-push: sm-build
+	aws ecr describe-repositories --repository-names $(ECR_REPO) --region $(AWS_REGION) >/dev/null 2>&1 \
+		|| aws ecr create-repository --repository-name $(ECR_REPO) --region $(AWS_REGION)
+	aws ecr get-login-password --region $(AWS_REGION) \
+		| docker login --username AWS --password-stdin $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com
+	aws ecr get-login-password --region $(AWS_REGION) \
+		| docker login --username AWS --password-stdin 763104351884.dkr.ecr.$(AWS_REGION).amazonaws.com
+	docker tag $(ECR_REPO):$(IMAGE_TAG) $(IMAGE_URI)
+	docker push $(IMAGE_URI)
+
+# Launch a single SageMaker training job
+sm-train:
+	uv run python sagemaker/launch_training.py \
+		--config configs/default.yaml \
+		--bucket $(SM_BUCKET) \
+		--role $(SM_ROLE) \
+		--region $(AWS_REGION) \
+		--instance-type $(SM_INSTANCE) \
+		--mlflow-uri "$(MLFLOW_URI)" \
+		--image-uri $(IMAGE_URI)
+
+# Launch one SageMaker job per sweep config (sequential; SM handles parallel slots)
+sm-sweep:
+	@for cfg in configs/sweep/*.yaml; do \
+		echo "=== Launching $$cfg ==="; \
+		uv run python sagemaker/launch_training.py \
+			--config $$cfg \
+			--bucket $(SM_BUCKET) \
+			--role $(SM_ROLE) \
+			--region $(AWS_REGION) \
+			--instance-type $(SM_INSTANCE) \
+			--mlflow-uri "$(MLFLOW_URI)" \
+			--image-uri $(IMAGE_URI) || exit 1; \
+	done
+
 # Full reproduction pipeline: download → generate → test → sweep
 reproduce: clean download-data generate-sweep test sweep
 
@@ -85,3 +141,10 @@ help:
 	@echo "  export         - Export results to LaTeX"
 	@echo "  reproduce      - Full reproduction pipeline"
 	@echo "  clean          - Remove cache files"
+	@echo ""
+	@echo "SageMaker:"
+	@echo "  pull-nber      - Download NBER USREC snapshot"
+	@echo "  sm-build       - Build training Docker image"
+	@echo "  sm-push        - Push image to ECR"
+	@echo "  sm-train       - Launch one SageMaker training job"
+	@echo "  sm-sweep       - Launch one job per sweep config"

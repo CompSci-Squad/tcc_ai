@@ -18,9 +18,15 @@ from tcc_itransformer.data.preprocessing import (
     scale_splits,
     split_by_date,
 )
+from tcc_itransformer.data.stationarity import (
+    StationarityResult,
+    check_series_stationarity,
+    validate_panel_stationarity,
+)
 
 __all__ = [
     "FREDMDWindowDataset",
+    "StationarityResult",
     "apply_tcode",
     "create_windows",
     "drop_high_nan_series",
@@ -29,7 +35,9 @@ __all__ = [
     "load_fred_md",
     "remove_outliers",
     "scale_splits",
+    "check_series_stationarity",
     "split_by_date",
     "transform_panel",
+    "validate_panel_stationarity",
     "verify_sha256",
 ]

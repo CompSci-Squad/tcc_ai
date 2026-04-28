@@ -13,6 +13,7 @@ from sklearn.metrics import (
     davies_bouldin_score,
     silhouette_score,
 )
+from sklearn.mixture import GaussianMixture
 
 
 def fit_adaptive_pca(
@@ -102,6 +103,71 @@ def select_k(
 
     best_k = max(scores, key=scores.get)  # type: ignore[arg-type]
     return {"best_k": best_k, "scores": scores}
+
+
+def select_k_combined(
+    embeddings_pca: np.ndarray,
+    k_range: list[int] | None = None,
+    *,
+    random_state: int = 42,
+) -> dict:
+    """Select best K combining Silhouette (KMeans) with BIC (GMM).
+
+    Pre_projeto §4.4 requires the K-Means baseline to use Silhouette **and**
+    BIC computed on a Gaussian Mixture Model fit in parallel — preventing
+    cluster-count selection driven by a single criterion.
+
+    Strategy:
+        - For each k in k_range, fit KMeans and a GMM (full covariance).
+        - Compute silhouette(KMeans labels) and BIC(GMM).
+        - Normalize each criterion to [0, 1] (higher is better) and average.
+        - best_k = argmax of the combined score.
+
+    Returns:
+        Dict with keys: best_k, silhouette (per-k), bic (per-k),
+        combined (per-k), and the chosen criterion.
+    """
+    if k_range is None:
+        k_range = [3, 4, 5]
+
+    sil: dict[int, float] = {}
+    bic: dict[int, float] = {}
+    for k in k_range:
+        km = KMeans(n_clusters=k, n_init=20, random_state=random_state)
+        labels = km.fit_predict(embeddings_pca)
+        sil[k] = float(silhouette_score(embeddings_pca, labels))
+
+        gmm = GaussianMixture(
+            n_components=k,
+            covariance_type="full",
+            n_init=5,
+            random_state=random_state,
+        )
+        gmm.fit(embeddings_pca)
+        bic[k] = float(gmm.bic(embeddings_pca))
+
+    sil_arr = np.array([sil[k] for k in k_range])
+    bic_arr = np.array([bic[k] for k in k_range])
+
+    def _norm(v: np.ndarray, *, lower_is_better: bool) -> np.ndarray:
+        if lower_is_better:
+            v = -v
+        rng = v.max() - v.min()
+        return (v - v.min()) / rng if rng > 0 else np.zeros_like(v)
+
+    sil_n = _norm(sil_arr, lower_is_better=False)
+    bic_n = _norm(bic_arr, lower_is_better=True)
+    combined_arr = 0.5 * sil_n + 0.5 * bic_n
+    combined = {k: float(combined_arr[i]) for i, k in enumerate(k_range)}
+
+    best_k = max(combined, key=combined.get)  # type: ignore[arg-type]
+    return {
+        "best_k": int(best_k),
+        "silhouette": sil,
+        "bic": bic,
+        "combined": combined,
+        "criterion": "silhouette+bic_gmm",
+    }
 
 
 def clustering_stability(

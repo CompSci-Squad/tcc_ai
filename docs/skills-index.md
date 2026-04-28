@@ -241,4 +241,11 @@
 
 ---
 
-*Last updated: 2026-04-17 — add new skills to this index whenever a new SKILL.md is added to `.github/skills/`.*
+### `regime-detection-validation`
+**Path:** `.github/skills/regime-detection-validation/SKILL.md`  
+**Summary:** Validação econômica e estrutural de regimes detectados em painéis macro: DBCV para HDBSCAN, NBER USREC overlap (hit rate / F1 com lead-lag), breakpoints de Bai-Perron, cobertura de janelas canônicas (GFC, dot-com, COVID), momentos condicionais por regime, matriz de transição, duração média e payload de explicabilidade.  
+**Triggers:** HDBSCAN, DBCV, NBER, USREC, Bai-Perron, regime switching, structural break, transition matrix, regime duration, conditional moments, explicabilidade de cluster.
+
+---
+
+*Last updated: 2026-04-28 — add new skills to this index whenever a new SKILL.md is added to `.github/skills/`.*

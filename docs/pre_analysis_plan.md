@@ -77,3 +77,74 @@ train/val/test split and non-overlapping windowing:
 
 Power for non-parametric tests is limited, especially for W=24. We acknowledge
 this limitation explicitly and use block bootstrap where feasible.
+
+---
+
+## Addendum (2026-04-28) — Principal pipeline alignment with pre_projeto_tcc.md
+
+After reviewing `docs/pre_projeto_tcc.md §4.3` against the originally-registered
+plan, the following changes were adopted **before** any test-set evaluation
+was performed (no peeking):
+
+### Option A — Principal pipeline = UMAP + HDBSCAN
+
+The pre_projeto specifies UMAP for dimensionality reduction and HDBSCAN for
+density-based clustering as the **principal** path; PCA + K-Means is retained
+as a **baseline** for the permutation test. Rationale:
+
+- HDBSCAN does not require K to be pre-specified and produces a noise label
+  for windows that do not belong to any cluster — this matches the
+  operational definition of "regime" (contiguous homogeneous interval).
+- UMAP preserves topological structure better than PCA in low-dimensional
+  embeddings, per the literature cited in the pre_projeto.
+- DBCV (Density-Based Clustering Validation) is the registered evaluation
+  metric for HDBSCAN; we use `hdbscan.HDBSCAN.relative_validity_` as the
+  standard library proxy.
+
+### Updated success criteria (additive)
+
+| Criterion | Threshold | Source |
+|---|---|---|
+| HDBSCAN noise fraction (TRAIN) | ≤ 0.4 | pre_projeto §4.3 |
+| HDBSCAN cluster count (TRAIN) | ≥ 2 | sanity |
+| DBCV (`relative_validity_`) | > 0 | pre_projeto §4.3 |
+| NBER overlap F1 (lead=0, lag=2) | reported | pre_projeto §4.4 |
+| Crisis windows covered | ≥ 3 of {dotcom, GFC, COVID} | pre_projeto §4.4 |
+
+### Validation modules (pre_projeto §4.4)
+
+All implemented in `evaluation/regime_validation.py`:
+
+- NBER USREC overlap (precision/recall/F1 with lead/lag)
+- Bai–Perron break alignment via `ruptures.Pelt` / `Dynp`
+- Conditional moments per regime (mean, std, skew, kurt by series)
+- Markov transition matrix (excluding noise)
+- Regime durations (n_runs, mean/median/max)
+- Module 4 (`evaluation/explain.py`): `{regime, soft_membership, top_features}`
+
+### Stationarity (pre_projeto §4.2)
+
+Joint **ADF + KPSS** rule (`data/stationarity.py`):
+- Stationary iff ADF rejects unit-root **and** KPSS fails to reject stationarity.
+
+### Statistical CIs
+
+Bootstrap CIs use the **BCa** method (`evaluation/statistical_tests.py:_bootstrap_ci`):
+z₀ from empirical mass + jackknife acceleration. The original plan's
+"percentile bootstrap" wording is superseded.
+
+### Reproducibility infrastructure
+
+All experiments are reproducible via:
+
+```bash
+make sm-build && make sm-push   # build + push training image to ECR
+make sm-train                   # 1 SageMaker job (default config)
+make sm-sweep                   # 36 jobs (configs/sweep/*.yaml)
+```
+
+Outputs are persisted under `s3://tcc-regime-etl-sagemaker/jobs/<job>/output/`
+and (optionally) logged to a SageMaker-managed MLflow tracking server
+(`var.enable_mlflow=true` in `tcc_iac/infra/mlflow.tf`).
+
+---

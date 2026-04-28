@@ -113,3 +113,62 @@ class TestValidKRange:
             f"Best K ({result['best_k']}) is outside valid range {{3, 4, 5}}. "
             f"Silhouette scores: {result['scores']}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Principal pipeline (UMAP + HDBSCAN) quality gates
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def umap_hdbscan_labels(trained_model_and_data: dict) -> dict:
+    """Run UMAP -> HDBSCAN-DBCV optimization on training embeddings."""
+    from tcc_itransformer.evaluation.density_clustering import optimize_hdbscan_dbcv
+    from tcc_itransformer.evaluation.dim_reduction import UMAPConfig, fit_umap
+
+    train_emb = trained_model_and_data["train_emb"]
+    config = trained_model_and_data["config"]
+
+    non_overlap_idx = extract_non_overlapping_indices(
+        n_windows=len(train_emb), window_size=config.window_size,
+    )
+    train_emb_no = train_emb[non_overlap_idx]
+
+    umap_cfg = UMAPConfig(
+        n_components=config.umap_n_components,
+        n_neighbors=config.umap_n_neighbors,
+        min_dist=config.umap_min_dist,
+        random_state=config.seed,
+    )
+    reducer = fit_umap(train_emb_no, umap_cfg)
+    train_umap = reducer.embedding_
+
+    best, _log = optimize_hdbscan_dbcv(
+        train_umap,
+        min_cluster_sizes=tuple(config.hdbscan_min_cluster_sizes),
+        min_samples_grid=tuple(config.hdbscan_min_samples_grid),
+        max_noise_fraction=config.hdbscan_max_noise_fraction,
+    )
+    return {"result": best, "n_samples": len(train_umap)}
+
+
+@pytest.mark.quality
+class TestHDBSCANNoiseFraction:
+    def test_noise_fraction_bounded(self, umap_hdbscan_labels: dict) -> None:
+        """HDBSCAN noise fraction on TRAIN must be <= 0.4 (pre_projeto §4.3)."""
+        noise = umap_hdbscan_labels["result"].noise_fraction
+        assert noise <= 0.4, f"Noise fraction {noise:.3f} exceeds 0.4 threshold"
+
+
+@pytest.mark.quality
+class TestHDBSCANClusterCount:
+    def test_at_least_two_clusters(self, umap_hdbscan_labels: dict) -> None:
+        n_clusters = umap_hdbscan_labels["result"].n_clusters
+        assert n_clusters >= 2, f"Only {n_clusters} HDBSCAN cluster(s) found; need >= 2"
+
+
+@pytest.mark.quality
+class TestHDBSCANDBCVPositive:
+    def test_dbcv_positive(self, umap_hdbscan_labels: dict) -> None:
+        """relative_validity_ (DBCV proxy) must be > 0 for meaningful clusters."""
+        dbcv = umap_hdbscan_labels["result"].dbcv
+        assert dbcv > 0.0, f"DBCV={dbcv:.4f} not positive"

@@ -12,11 +12,13 @@ from pathlib import Path
 
 import mlflow
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
 from tcc_itransformer.config import ExperimentConfig
 from tcc_itransformer.data.dataset import FREDMDWindowDataset
+from tcc_itransformer.data.external_labels import load_usrec
 from tcc_itransformer.data.fred_md import load_fred_md, transform_panel
 from tcc_itransformer.data.preprocessing import (
     create_windows,
@@ -35,6 +37,21 @@ from tcc_itransformer.evaluation.clustering import (
     fit_adaptive_pca,
     fit_kmeans,
     select_k,
+    select_k_combined,
+)
+from tcc_itransformer.evaluation.density_clustering import optimize_hdbscan_dbcv
+from tcc_itransformer.evaluation.dim_reduction import UMAPConfig, apply_umap, fit_umap
+from tcc_itransformer.evaluation.explain import (
+    explain_assignment,
+    explanations_to_frame,
+)
+from tcc_itransformer.evaluation.regime_validation import (
+    bai_perron_alignment,
+    crisis_window_coverage,
+    nber_overlap,
+    regime_conditional_moments,
+    regime_durations,
+    transition_matrix,
 )
 from tcc_itransformer.evaluation.effective_sample_size import (
     compute_effective_n,
@@ -124,7 +141,7 @@ def _compute_model_test_mse(
     return mse_sum / max(n, 1)
 
 
-def run_experiment(config: ExperimentConfig) -> tuple[dict, dict]:
+def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     """Execute the full experiment pipeline for one configuration.
 
     Args:
@@ -265,6 +282,147 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict]:
     # --- 14. Regime transitions ---
     metrics["test_regime_transitions"] = float(compute_regime_transitions(test_labels))
 
+    # --- 14b. Combined K selection (Silhouette + BIC/GMM) — pre_projeto §4.4 ---
+    if len(train_pca) >= 10:
+        k_combined = select_k_combined(train_pca, k_range=[3, 4, 5], random_state=config.seed)
+        metrics["best_k_combined"] = float(k_combined["best_k"])
+        for k_val, v in k_combined["combined"].items():
+            metrics[f"k_combined_score_K{k_val}"] = float(v)
+
+    # --- 14c. Principal pipeline: UMAP -> HDBSCAN -> validation -> explain ---
+    # Pre_projeto §4.3 Modules 2-4 + §4.4 validation layers 2-3.
+    principal_artifacts: dict[str, object] = {}
+    try:
+        umap_cfg = UMAPConfig(
+            n_components=config.umap_n_components,
+            n_neighbors=config.umap_n_neighbors,
+            min_dist=config.umap_min_dist,
+            random_state=config.seed,
+        )
+        umap_reducer = fit_umap(train_emb_no, umap_cfg)
+        train_umap = apply_umap(train_emb_no, umap_reducer)
+        test_umap = apply_umap(test_emb_no, umap_reducer)
+
+        # HDBSCAN with DBCV optimization on TRAIN (no leakage).
+        hdb_best, hdb_log = optimize_hdbscan_dbcv(
+            train_umap,
+            min_cluster_sizes=tuple(config.hdbscan_min_cluster_sizes),
+            min_samples_grid=tuple(config.hdbscan_min_samples_grid),
+            max_noise_fraction=config.hdbscan_max_noise_fraction,
+        )
+        metrics["hdbscan_train_dbcv"] = hdb_best.dbcv
+        metrics["hdbscan_train_n_clusters"] = float(hdb_best.n_clusters)
+        metrics["hdbscan_train_noise_fraction"] = hdb_best.noise_fraction
+        metrics["hdbscan_min_cluster_size"] = float(hdb_best.min_cluster_size)
+        metrics["hdbscan_min_samples"] = float(hdb_best.min_samples)
+
+        # Apply best clusterer to TEST via approximate_predict (HDBSCAN soft API).
+        try:
+            import hdbscan as _hdbscan  # local import; already a hard dep
+            hdb_test_labels, hdb_test_probs = _hdbscan.approximate_predict(
+                hdb_best.clusterer, test_umap,
+            )
+        except Exception:  # pragma: no cover — fall back to refitting on test
+            from tcc_itransformer.evaluation.density_clustering import fit_hdbscan
+            _refit = fit_hdbscan(
+                test_umap,
+                min_cluster_size=hdb_best.min_cluster_size,
+                min_samples=hdb_best.min_samples,
+            )
+            hdb_test_labels = _refit.labels
+            hdb_test_probs = _refit.probabilities
+
+        n_test_clusters = int(len(set(hdb_test_labels)) - (1 if -1 in hdb_test_labels else 0))
+        metrics["hdbscan_test_n_clusters"] = float(n_test_clusters)
+        metrics["hdbscan_test_noise_fraction"] = float(np.mean(hdb_test_labels == -1))
+
+        # Recover dates for non-overlapping TEST windows (use last timestep of each window).
+        stride_test = config.window_size  # extract_non_overlapping_indices uses stride=W
+        test_dates_all = test_df.index
+        test_window_dates = pd.DatetimeIndex(
+            [
+                test_dates_all[i * stride_test + config.window_size - 1]
+                for i in range(len(test_emb_no))
+                if i * stride_test + config.window_size - 1 < len(test_dates_all)
+            ]
+        )
+        # Trim labels/probs to match available dates.
+        m = len(test_window_dates)
+        hdb_test_labels = np.asarray(hdb_test_labels[:m])
+        hdb_test_probs = np.asarray(hdb_test_probs[:m])
+
+        # ---- Layer 2: NBER overlap ----
+        try:
+            usrec = load_usrec(config.nber_usrec_path)
+            nber_res = nber_overlap(hdb_test_labels, test_window_dates, usrec, lead=0, lag=2)
+            metrics["nber_f1"] = nber_res.f1
+            metrics["nber_precision"] = nber_res.precision
+            metrics["nber_recall"] = nber_res.recall
+            metrics["nber_matched_cluster"] = float(nber_res.matched_cluster)
+        except FileNotFoundError as exc:
+            logger.warning("Skipping NBER overlap: %s", exc)
+            mlflow.set_tag("nber_status", "snapshot_missing")
+
+        # ---- Layer 2: Bai-Perron alignment on first PC of test panel ----
+        try:
+            from sklearn.decomposition import PCA as _PCA
+            test_panel_arr = test_scaled[
+                config.window_size - 1 : config.window_size - 1 + m * stride_test : stride_test
+            ]
+            if len(test_panel_arr) >= 10:
+                pc1 = _PCA(n_components=1).fit_transform(test_panel_arr).ravel()
+                bp = bai_perron_alignment(hdb_test_labels, pc1, penalty=10.0, tolerance=2)
+                metrics["bai_perron_f1"] = bp["f1"]
+                metrics["bai_perron_n_breakpoints"] = float(bp["n_breakpoints"])
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Bai-Perron alignment failed: %s", exc)
+
+        # ---- Layer 2: crisis windows coverage ----
+        crisis = crisis_window_coverage(hdb_test_labels, test_window_dates)
+        for crisis_name, info in crisis.items():
+            metrics[f"crisis_{crisis_name}_dominant_cluster"] = float(info.get("dominant_cluster", -1))
+
+        # ---- Layer 3: interpretability ----
+        # Build a per-window panel: mean of each window across W timesteps, in feature space.
+        feat_cols = list(filled.columns)
+        per_window_panel = pd.DataFrame(
+            test_windows[test_no_idx][:m].mean(axis=1),
+            index=test_window_dates,
+            columns=feat_cols,
+        )
+        moments = regime_conditional_moments(per_window_panel, hdb_test_labels)
+        durations = regime_durations(hdb_test_labels)
+        trans = transition_matrix(hdb_test_labels)
+        metrics["n_regime_transitions_hdbscan"] = float(
+            sum(1 for i in range(1, len(hdb_test_labels)) if hdb_test_labels[i] != hdb_test_labels[i - 1])
+        )
+        if not durations.empty:
+            metrics["mean_regime_duration_months"] = float(durations["mean_duration"].mean())
+
+        # ---- Module 4: explanations ----
+        explanations = explain_assignment(
+            per_window_panel,
+            hdb_test_labels,
+            probabilities=hdb_test_probs,
+            top_k=config.explain_top_k,
+            membership_source="soft",
+        )
+        explain_df = explanations_to_frame(explanations)
+
+        principal_artifacts = {
+            "hdb_grid_log": hdb_log,
+            "moments": moments,
+            "durations": durations,
+            "transition_matrix": trans,
+            "explanations": explain_df,
+            "test_dates": test_window_dates,
+            "test_labels": hdb_test_labels,
+            "test_probs": hdb_test_probs,
+        }
+    except Exception as exc:  # pragma: no cover
+        logger.exception("Principal UMAP+HDBSCAN pipeline failed: %s", exc)
+        mlflow.set_tag("principal_pipeline_status", "failed")
+
     # --- 15. Clustering stability ---
     stability = clustering_stability(train_pca, config.n_clusters, n_runs=5, random_state=config.seed)
     metrics["clustering_stability_ari"] = stability
@@ -328,7 +486,101 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict]:
         metrics["bootstrap_silhouette_ci_lower"] = boot_result["ci_lower"]
         metrics["bootstrap_silhouette_ci_upper"] = boot_result["ci_upper"]
 
-    return metrics, history
+    return metrics, history, principal_artifacts
+
+
+def run_full_pipeline(
+    config: ExperimentConfig,
+    model_dir: Path | str | None = None,
+    aux_dir: Path | str | None = None,
+) -> dict:
+    """End-to-end pipeline used by SageMaker entrypoint and CLI alike.
+
+    Persists:
+        - {model_dir}/metrics.json     — flat metrics dict
+        - {aux_dir}/history.json       — per-epoch losses
+        - {aux_dir}/explanations.parquet, moments.parquet,
+          transition_matrix.parquet, durations.parquet,
+          hdbscan_grid.json (when principal pipeline succeeds)
+
+    Returns:
+        The metrics dict.
+    """
+    import json
+
+    model_dir = Path(model_dir) if model_dir else Path(config.results_dir) / "model"
+    aux_dir = Path(aux_dir) if aux_dir else Path(config.results_dir) / "aux"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    aux_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics, history, artifacts = run_experiment(config)
+
+    (model_dir / "metrics.json").write_text(json.dumps(metrics, indent=2, default=str))
+    (aux_dir / "history.json").write_text(json.dumps(history, indent=2, default=str))
+    config.to_yaml(model_dir / "config.yaml")
+
+    _persist_principal_artifacts(artifacts, aux_dir)
+
+    # Best-effort MLflow log_artifact (no-op outside an active run).
+    try:
+        if mlflow.active_run() is not None:
+            for fname in (
+                "metrics.json",
+            ):
+                fp = model_dir / fname
+                if fp.exists():
+                    mlflow.log_artifact(str(fp))
+            for fname in (
+                "history.json",
+                "explanations.parquet",
+                "moments.parquet",
+                "transition_matrix.parquet",
+                "durations.parquet",
+                "hdbscan_grid.json",
+                "test_labels.parquet",
+            ):
+                fp = aux_dir / fname
+                if fp.exists():
+                    mlflow.log_artifact(str(fp))
+    except Exception:  # pragma: no cover
+        logger.debug("MLflow log_artifact skipped", exc_info=True)
+
+    logger.info("Persisted metrics, history, and principal artifacts to %s / %s", model_dir, aux_dir)
+    return metrics
+
+
+def _persist_principal_artifacts(artifacts: dict, aux_dir: Path) -> None:
+    import json as _json
+
+    if not artifacts:
+        return
+    try:
+        moments = artifacts.get("moments")
+        if moments is not None:
+            moments.to_parquet(aux_dir / "moments.parquet")
+        durations = artifacts.get("durations")
+        if durations is not None:
+            durations.to_parquet(aux_dir / "durations.parquet")
+        trans = artifacts.get("transition_matrix")
+        if trans is not None:
+            trans.to_parquet(aux_dir / "transition_matrix.parquet")
+        explain_df = artifacts.get("explanations")
+        if explain_df is not None:
+            explain_df.to_parquet(aux_dir / "explanations.parquet")
+        grid = artifacts.get("hdb_grid_log")
+        if grid is not None:
+            (aux_dir / "hdbscan_grid.json").write_text(_json.dumps(grid, indent=2, default=str))
+        labels = artifacts.get("test_labels")
+        dates = artifacts.get("test_dates")
+        probs = artifacts.get("test_probs")
+        if labels is not None and dates is not None:
+            import pandas as _pd
+            df = _pd.DataFrame({"date": list(dates), "label": list(labels)})
+            if probs is not None:
+                df["probability"] = list(probs)
+            df.to_parquet(aux_dir / "test_labels.parquet")
+    except Exception:  # pragma: no cover
+        logger.exception("Failed to persist some principal artifacts")
 
 
 def main() -> None:
@@ -344,7 +596,7 @@ def main() -> None:
 
     with mlflow.start_run(experiment_id=experiment_id, run_name=run_name):
         log_config(config)
-        metrics, history = run_experiment(config)
+        metrics, history, artifacts = run_experiment(config)
 
         # Log per-epoch metrics
         for epoch, (tl, vl) in enumerate(
@@ -354,6 +606,16 @@ def main() -> None:
 
         # Log evaluation metrics
         log_evaluation_metrics(metrics)
+
+        # Persist principal artifacts to aux dir + log to MLflow.
+        aux_dir = Path(config.results_dir) / "aux" / run_name
+        aux_dir.mkdir(parents=True, exist_ok=True)
+        _persist_principal_artifacts(artifacts, aux_dir)
+        for fname in ("explanations.parquet", "moments.parquet", "transition_matrix.parquet",
+                      "durations.parquet", "hdbscan_grid.json", "test_labels.parquet"):
+            fp = aux_dir / fname
+            if fp.exists():
+                mlflow.log_artifact(str(fp))
 
     logger.info("Experiment complete. Run: %s", run_name)
 

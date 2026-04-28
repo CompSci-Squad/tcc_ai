@@ -42,6 +42,20 @@ class ExperimentConfig(BaseModel):
     pca_variance_threshold: float = Field(default=0.9, gt=0, le=1)
     n_pca_max: int = Field(default=5, ge=1)
 
+    # UMAP (principal — pre_projeto §4.3 Module 2)
+    umap_n_components: int = Field(default=5, ge=2, le=20)
+    umap_n_neighbors: int = Field(default=15, ge=2)
+    umap_min_dist: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    # HDBSCAN (principal — pre_projeto §4.3 Module 3)
+    hdbscan_min_cluster_sizes: list[int] = Field(default=[5, 8, 10, 15, 20])
+    hdbscan_min_samples_grid: list[int | None] = Field(default=[None, 1, 5])
+    hdbscan_max_noise_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    # Validation snapshots
+    nber_usrec_path: str = "data/snapshots/nber_usrec.csv"
+    explain_top_k: int = Field(default=5, ge=1, le=50)
+
     # Data splits
     train_end: str = "2018-12-01"
     val_end: str = "2021-12-01"
