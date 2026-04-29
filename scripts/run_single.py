@@ -83,6 +83,10 @@ from tcc_itransformer.training.trainer import Trainer
 logger = logging.getLogger(__name__)
 
 
+class _SkipClustering(Exception):
+    """Sentinel raised to short-circuit the UMAP+HDBSCAN block when disabled."""
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run single iTransformer experiment.")
     parser.add_argument(
@@ -197,6 +201,20 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     val_emb = trainer.extract_embeddings(val_loader)
     test_emb = trainer.extract_embeddings(test_loader)
 
+    # Window-end dates for each split (stride=1 in create_windows).
+    W = config.window_size
+    train_emb_dates = pd.DatetimeIndex(train_df.index[W - 1 : W - 1 + len(train_emb)])
+    val_emb_dates = pd.DatetimeIndex(val_df.index[W - 1 : W - 1 + len(val_emb)])
+    test_emb_dates = pd.DatetimeIndex(test_df.index[W - 1 : W - 1 + len(test_emb)])
+
+    # Initialise artifacts dict early so embeddings are persisted even if the
+    # downstream UMAP+HDBSCAN pipeline raises.
+    principal_artifacts: dict[str, object] = {
+        "embeddings_train": (train_emb, train_emb_dates),
+        "embeddings_val": (val_emb, val_emb_dates),
+        "embeddings_test": (test_emb, test_emb_dates),
+    }
+
     # --- 8. Embedding quality ---
     collapse_info = check_embedding_collapse(train_emb)
     eff_rank = compute_effective_rank(train_emb)
@@ -260,39 +278,50 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     val_pca = apply_pca(val_emb_no, pca)
 
     # --- 13. K selection on train, evaluate on test ---
-    k_selection = select_k(train_pca, k_range=[3, 4, 5])
-    best_k = k_selection["best_k"]
-    metrics["best_k"] = float(best_k)
-    for k_val, sil_val in k_selection["scores"].items():
-        metrics[f"train_silhouette_K{k_val}"] = sil_val
+    # Skipped when config.run_clustering=False (e.g. SageMaker AE-only sweeps).
+    # Embeddings + reconstruction metrics are still persisted for downstream
+    # clustering ablation via scripts/run_clustering_ablation.py.
+    if config.run_clustering:
+        k_selection = select_k(train_pca, k_range=[3, 4, 5])
+        best_k = k_selection["best_k"]
+        metrics["best_k"] = float(best_k)
+        for k_val, sil_val in k_selection["scores"].items():
+            metrics[f"train_silhouette_K{k_val}"] = sil_val
 
-    # Fit KMeans on train, predict on test
-    km = fit_kmeans(train_pca, config.n_clusters, random_state=config.seed)
-    test_labels = km.predict(test_pca)
-    test_cluster_metrics = compute_clustering_metrics(test_pca, test_labels)
-    for metric_name, metric_val in test_cluster_metrics.items():
-        metrics[f"test_{metric_name}"] = metric_val
+        # Fit KMeans on train, predict on test
+        km = fit_kmeans(train_pca, config.n_clusters, random_state=config.seed)
+        test_labels = km.predict(test_pca)
+        test_cluster_metrics = compute_clustering_metrics(test_pca, test_labels)
+        for metric_name, metric_val in test_cluster_metrics.items():
+            metrics[f"test_{metric_name}"] = metric_val
 
-    # Val for comparison logging
-    val_labels = km.predict(val_pca)
-    val_cluster_metrics = compute_clustering_metrics(val_pca, val_labels)
-    for metric_name, metric_val in val_cluster_metrics.items():
-        metrics[f"val_{metric_name}"] = metric_val
+        # Val for comparison logging
+        val_labels = km.predict(val_pca)
+        val_cluster_metrics = compute_clustering_metrics(val_pca, val_labels)
+        for metric_name, metric_val in val_cluster_metrics.items():
+            metrics[f"val_{metric_name}"] = metric_val
 
-    # --- 14. Regime transitions ---
-    metrics["test_regime_transitions"] = float(compute_regime_transitions(test_labels))
+        # --- 14. Regime transitions ---
+        metrics["test_regime_transitions"] = float(compute_regime_transitions(test_labels))
 
-    # --- 14b. Combined K selection (Silhouette + BIC/GMM) — pre_projeto §4.4 ---
-    if len(train_pca) >= 10:
-        k_combined = select_k_combined(train_pca, k_range=[3, 4, 5], random_state=config.seed)
-        metrics["best_k_combined"] = float(k_combined["best_k"])
-        for k_val, v in k_combined["combined"].items():
-            metrics[f"k_combined_score_K{k_val}"] = float(v)
+        # --- 14b. Combined K selection (Silhouette + BIC/GMM) — pre_projeto §4.4 ---
+        if len(train_pca) >= 10:
+            k_combined = select_k_combined(train_pca, k_range=[3, 4, 5], random_state=config.seed)
+            metrics["best_k_combined"] = float(k_combined["best_k"])
+            for k_val, v in k_combined["combined"].items():
+                metrics[f"k_combined_score_K{k_val}"] = float(v)
+    else:
+        logger.info("Skipping KMeans/K-selection block (run_clustering=False).")
 
     # --- 14c. Principal pipeline: UMAP -> HDBSCAN -> validation -> explain ---
     # Pre_projeto §4.3 Modules 2-4 + §4.4 validation layers 2-3.
-    principal_artifacts: dict[str, object] = {}
+    # Skipped when config.run_clustering=False (e.g. SageMaker AE-only sweeps).
+    # Embeddings + reconstruction metrics are still persisted for downstream
+    # clustering ablation via scripts/run_clustering_ablation.py.
     try:
+        if not config.run_clustering:
+            logger.info("Skipping UMAP+HDBSCAN block (run_clustering=False).")
+            raise _SkipClustering
         umap_cfg = UMAPConfig(
             n_components=config.umap_n_components,
             n_neighbors=config.umap_n_neighbors,
@@ -409,7 +438,7 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
         )
         explain_df = explanations_to_frame(explanations)
 
-        principal_artifacts = {
+        principal_artifacts.update({
             "hdb_grid_log": hdb_log,
             "moments": moments,
             "durations": durations,
@@ -418,73 +447,77 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
             "test_dates": test_window_dates,
             "test_labels": hdb_test_labels,
             "test_probs": hdb_test_probs,
-        }
+        })
+    except _SkipClustering:
+        pass
     except Exception as exc:  # pragma: no cover
         logger.exception("Principal UMAP+HDBSCAN pipeline failed: %s", exc)
         mlflow.set_tag("principal_pipeline_status", "failed")
 
-    # --- 15. Clustering stability ---
-    stability = clustering_stability(train_pca, config.n_clusters, n_runs=5, random_state=config.seed)
-    metrics["clustering_stability_ari"] = stability
+    # --- 15-18. Clustering-dependent statistics — skipped when clustering disabled. ---
+    if config.run_clustering:
+        # --- 15. Clustering stability ---
+        stability = clustering_stability(train_pca, config.n_clusters, n_runs=5, random_state=config.seed)
+        metrics["clustering_stability_ari"] = stability
 
-    # --- 16. Statistical tests on test set ---
-    is_exploratory = config.window_size == 24
-    if is_exploratory:
-        mlflow.set_tag("analysis_type", "exploratory")
-        mlflow.set_tag("power_warning", "W=24: n_eff too low for inference")
+        # --- 16. Statistical tests on test set ---
+        is_exploratory = config.window_size == 24
+        if is_exploratory:
+            mlflow.set_tag("analysis_type", "exploratory")
+            mlflow.set_tag("power_warning", "W=24: n_eff too low for inference")
 
-    # Kruskal-Wallis per dimension
-    if len(test_pca) >= 3 and len(np.unique(test_labels)) >= 2:
-        kw_results = kruskal_wallis_per_dim(test_pca, test_labels)
-        metrics["kw_n_significant"] = float(kw_results["n_significant"])
-        metrics["kw_mean_effect_size"] = float(np.mean(kw_results["effect_sizes"]))
+        # Kruskal-Wallis per dimension
+        if len(test_pca) >= 3 and len(np.unique(test_labels)) >= 2:
+            kw_results = kruskal_wallis_per_dim(test_pca, test_labels)
+            metrics["kw_n_significant"] = float(kw_results["n_significant"])
+            metrics["kw_mean_effect_size"] = float(np.mean(kw_results["effect_sizes"]))
 
-        # Pairwise Mann-Whitney
-        mw_results = pairwise_mann_whitney(test_pca, test_labels)
-        metrics["mw_mean_effect_size"] = float(np.mean(np.abs(mw_results["effect_sizes"])))
+            # Pairwise Mann-Whitney
+            mw_results = pairwise_mann_whitney(test_pca, test_labels)
+            metrics["mw_mean_effect_size"] = float(np.mean(np.abs(mw_results["effect_sizes"])))
 
-    # --- 17. Baselines + permutation test ---
-    baseline_results = run_all_baselines(
-        train_windows=train_windows,
-        eval_windows=test_windows[test_no_idx] if test_windows.ndim == 3 else test_windows,
-        n_components=n_pca,
-        k=config.n_clusters,
-        random_state=config.seed,
-    )
-
-    for bname, bresult in baseline_results.items():
-        metrics[f"baseline_{bname}_silhouette"] = bresult["silhouette"]
-
-    # Permutation test: iTransformer vs Raw PCA (primary test)
-    if "raw_pca" in baseline_results and len(test_pca) >= 3:
-        b1_emb = baseline_results["raw_pca"]["embeddings"]
-        b1_labels = baseline_results["raw_pca"]["labels"]
-        perm_result = permutation_test_silhouette(
-            test_pca, test_labels, b1_emb, b1_labels,
-            n_permutations=10000, random_state=config.seed,
+        # --- 17. Baselines + permutation test ---
+        baseline_results = run_all_baselines(
+            train_windows=train_windows,
+            eval_windows=test_windows[test_no_idx] if test_windows.ndim == 3 else test_windows,
+            n_components=n_pca,
+            k=config.n_clusters,
+            random_state=config.seed,
         )
-        metrics["perm_delta_silhouette"] = perm_result["observed_diff"]
-        metrics["perm_p_value"] = perm_result["p_value"]
-        metrics["perm_ci_lower"] = perm_result["ci_lower"]
-        metrics["perm_ci_upper"] = perm_result["ci_upper"]
 
-    # --- 18. Block bootstrap CI for silhouette (if viable) ---
-    if n_eff_train >= 20 and len(train_pca) >= 3:
-        def _sil_fn(data: np.ndarray) -> float:
-            _km = fit_kmeans(data, config.n_clusters, random_state=config.seed)
-            _labels = _km.predict(data)
-            if len(np.unique(_labels)) < 2:
-                return 0.0
-            from sklearn.metrics import silhouette_score
-            return float(silhouette_score(data, _labels))
+        for bname, bresult in baseline_results.items():
+            metrics[f"baseline_{bname}_silhouette"] = bresult["silhouette"]
 
-        boot_result = moving_block_bootstrap(
-            _sil_fn, train_pca,
-            block_length=max(1, config.window_size // 2),
-            n_bootstrap=5000, random_state=config.seed,
-        )
-        metrics["bootstrap_silhouette_ci_lower"] = boot_result["ci_lower"]
-        metrics["bootstrap_silhouette_ci_upper"] = boot_result["ci_upper"]
+        # Permutation test: iTransformer vs Raw PCA (primary test)
+        if "raw_pca" in baseline_results and len(test_pca) >= 3:
+            b1_emb = baseline_results["raw_pca"]["embeddings"]
+            b1_labels = baseline_results["raw_pca"]["labels"]
+            perm_result = permutation_test_silhouette(
+                test_pca, test_labels, b1_emb, b1_labels,
+                n_permutations=10000, random_state=config.seed,
+            )
+            metrics["perm_delta_silhouette"] = perm_result["observed_diff"]
+            metrics["perm_p_value"] = perm_result["p_value"]
+            metrics["perm_ci_lower"] = perm_result["ci_lower"]
+            metrics["perm_ci_upper"] = perm_result["ci_upper"]
+
+        # --- 18. Block bootstrap CI for silhouette (if viable) ---
+        if n_eff_train >= 20 and len(train_pca) >= 3:
+            def _sil_fn(data: np.ndarray) -> float:
+                _km = fit_kmeans(data, config.n_clusters, random_state=config.seed)
+                _labels = _km.predict(data)
+                if len(np.unique(_labels)) < 2:
+                    return 0.0
+                from sklearn.metrics import silhouette_score
+                return float(silhouette_score(data, _labels))
+
+            boot_result = moving_block_bootstrap(
+                _sil_fn, train_pca,
+                block_length=max(1, config.window_size // 2),
+                n_bootstrap=5000, random_state=config.seed,
+            )
+            metrics["bootstrap_silhouette_ci_lower"] = boot_result["ci_lower"]
+            metrics["bootstrap_silhouette_ci_upper"] = boot_result["ci_upper"]
 
     return metrics, history, principal_artifacts
 
@@ -538,6 +571,9 @@ def run_full_pipeline(
                 "durations.parquet",
                 "hdbscan_grid.json",
                 "test_labels.parquet",
+                "embeddings/Z_train.parquet",
+                "embeddings/Z_val.parquet",
+                "embeddings/Z_test.parquet",
             ):
                 fp = aux_dir / fname
                 if fp.exists():
@@ -555,6 +591,26 @@ def _persist_principal_artifacts(artifacts: dict, aux_dir: Path) -> None:
     if not artifacts:
         return
     try:
+        # ---- Embeddings: Z_{train,val,test}.parquet ---------------------
+        # Schema: date (datetime64[ns]), z_0 .. z_{d-1} (float32).
+        # These are the canonical inputs for downstream clustering ablations
+        # (UMAP vs t-SNE × KMeans vs HDBSCAN), so persist them unconditionally.
+        emb_dir = aux_dir / "embeddings"
+        emb_dir.mkdir(parents=True, exist_ok=True)
+        import pandas as _pd
+        for split in ("train", "val", "test"):
+            entry = artifacts.get(f"embeddings_{split}")
+            if entry is None:
+                continue
+            Z, dates = entry
+            d = Z.shape[1]
+            df = _pd.DataFrame(
+                Z.astype("float32"),
+                columns=[f"z_{i}" for i in range(d)],
+            )
+            df.insert(0, "date", _pd.DatetimeIndex(dates))
+            df.to_parquet(emb_dir / f"Z_{split}.parquet", index=False)
+
         moments = artifacts.get("moments")
         if moments is not None:
             moments.to_parquet(aux_dir / "moments.parquet")

@@ -52,6 +52,12 @@ class ExperimentConfig(BaseModel):
     hdbscan_min_samples_grid: list[int | None] = Field(default=[None, 1, 5])
     hdbscan_max_noise_fraction: float = Field(default=0.5, ge=0.0, le=1.0)
 
+    # Pipeline gates — when False, only train AE + extract embeddings + reconstruction MSE.
+    # The downstream UMAP/HDBSCAN/NBER/explanations block is then skipped, which keeps
+    # SageMaker training jobs cheap (GPU only does AE work). Run the clustering grid
+    # afterwards via scripts/run_clustering_ablation.py against the cached embeddings.
+    run_clustering: bool = True
+
     # Validation snapshots
     nber_usrec_path: str = "data/snapshots/nber_usrec.csv"
     explain_top_k: int = Field(default=5, ge=1, le=50)

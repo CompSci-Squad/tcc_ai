@@ -11,11 +11,12 @@ import argparse
 import hashlib
 import logging
 from pathlib import Path
-from urllib.request import urlretrieve
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
-FRED_MD_BASE_URL = "https://files.stlouisfed.org/files/htdocs/fred-md"
+FRED_MD_BASE_URL = "https://www.stlouisfed.org/-/media/project/frbstl/stlouisfed/research/fred-md"
 SNAPSHOT_DIR = Path("data/snapshots")
 
 
@@ -24,8 +25,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vintage",
         type=str,
-        default="2026-04",
-        help="FRED-MD vintage in YYYY-MM format (default: 2026-04).",
+        default="2026-03",
+        help="FRED-MD vintage in YYYY-MM format (default: 2026-03).",
     )
     parser.add_argument(
         "--output-dir",
@@ -62,11 +63,15 @@ def download_fred_md(vintage: str, output_dir: Path) -> tuple[Path, Path]:
     csv_path = output_dir / csv_name
     hash_path = output_dir / f"{csv_name.replace('.csv', '.sha256')}"
 
-    # FRED-MD URL pattern: monthly/YYYY-MM.csv
-    url = f"{FRED_MD_BASE_URL}/monthly/{vintage}.csv"
+    # FRED-MD URL pattern (current): monthly/YYYY-MM-md.csv on stlouisfed.org
+    url = f"{FRED_MD_BASE_URL}/monthly/{vintage}-md.csv"
     logger.info("Downloading FRED-MD vintage %s from %s", vintage, url)
 
-    urlretrieve(url, csv_path)  # noqa: S310
+    # Use httpx with a real User-Agent — the stlouisfed CDN 403s on default urllib UA.
+    with httpx.Client(follow_redirects=True, timeout=60.0) as client:
+        resp = client.get(url, headers={"User-Agent": "tcc-itransformer/1.0"})
+        resp.raise_for_status()
+        csv_path.write_bytes(resp.content)
     logger.info("Saved CSV to %s (%d bytes)", csv_path, csv_path.stat().st_size)
 
     # Compute and save SHA-256

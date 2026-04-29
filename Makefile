@@ -3,12 +3,13 @@
 # AWS / SageMaker variables (override on CLI: make sm-build AWS_ACCOUNT=...)
 AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
 AWS_REGION  ?= us-east-1
-ECR_REPO    ?= tcc-itransformer
+ECR_REPO    ?= tcc-regime-etl-itransformer
 IMAGE_TAG   ?= latest
 IMAGE_URI   := $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPO):$(IMAGE_TAG)
 SM_BUCKET   ?= tcc-regime-etl-sagemaker
-SM_ROLE     ?= arn:aws:iam::$(AWS_ACCOUNT):role/SageMakerExecRole
-SM_INSTANCE ?= ml.g4dn.xlarge
+SM_ROLE     ?= arn:aws:iam::$(AWS_ACCOUNT):role/LabRole
+SM_INSTANCE ?= ml.m5.xlarge   # cheap CPU box for AE training (~$0.23/hr); override for sweep
+SM_CONFIG   ?= configs/sagemaker_ae_only.yaml
 MLFLOW_URI  ?=
 
 # Install all dependencies
@@ -97,20 +98,22 @@ sm-push: sm-build
 
 # Launch a single SageMaker training job
 sm-train:
-	uv run python sagemaker/launch_training.py \
-		--config configs/default.yaml \
+	uv run python sm_jobs/launch_training.py \
+		--config $(SM_CONFIG) \
 		--bucket $(SM_BUCKET) \
 		--role $(SM_ROLE) \
 		--region $(AWS_REGION) \
 		--instance-type $(SM_INSTANCE) \
 		--mlflow-uri "$(MLFLOW_URI)" \
-		--image-uri $(IMAGE_URI)
+		--image-uri $(IMAGE_URI) \
+		--data-prefix raw \
+		--usrec-prefix raw/USREC.csv
 
 # Launch one SageMaker job per sweep config (sequential; SM handles parallel slots)
 sm-sweep:
 	@for cfg in configs/sweep/*.yaml; do \
 		echo "=== Launching $$cfg ==="; \
-		uv run python sagemaker/launch_training.py \
+		uv run python sm_jobs/launch_training.py \
 			--config $$cfg \
 			--bucket $(SM_BUCKET) \
 			--role $(SM_ROLE) \

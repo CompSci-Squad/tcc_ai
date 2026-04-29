@@ -51,24 +51,67 @@ def main() -> None:
     args = parse_args()
 
     config_path = Path(args.config)
-    if not config_path.exists():
-        # Inside SM, code dir is current working directory; try resolving there.
-        alt = Path("/opt/ml/code") / args.config
-        if alt.exists():
-            config_path = alt
+    if not config_path.is_absolute() and not config_path.exists():
+        # Try common SM locations + script's own dir.
+        candidates = [
+            Path("/opt/ml/code") / args.config,
+            Path(__file__).resolve().parent / args.config,
+            Path(__file__).resolve().parent.parent / args.config,
+        ]
+        for alt in candidates:
+            if alt.exists():
+                config_path = alt
+                break
+        else:
+            raise FileNotFoundError(
+                f"Config {args.config!r} not found. Tried cwd={Path.cwd()} and {candidates}"
+            )
     cfg = ExperimentConfig.from_yaml(config_path)
 
     # Resolve data path: prefer SM channel mount.
     sm_training = os.environ.get("SM_CHANNEL_TRAINING")
     if sm_training:
-        # Prefer FRED-MD-format CSV; fall back to parquet panel.
-        candidates = sorted(Path(sm_training).rglob("*.csv"))
-        if candidates:
-            cfg = cfg.model_copy(update={"data_path": str(candidates[0])})
+        # Prefer parquet panel; fall back to FRED-MD-format CSV. Skip
+        # USREC.csv if it accidentally lands in the training channel
+        # (it shares the same s3://.../raw/ prefix as the FRED panel).
+        parquets = sorted(Path(sm_training).rglob("*.parquet"))
+        if parquets:
+            # The downstream pipeline (`load_fred_md`) expects FRED-MD CSV
+            # layout: row 1 = headers, row 2 = integer tcodes, row 3+ = data.
+            # tcc_etl currently writes only a *raw* wide parquet (no tcodes),
+            # so synthesize a FRED-MD-format CSV with tcode=1 (level, no
+            # transformation) for every series. This unblocks training but
+            # disables the stationarity step — proper tcodes are a tcc_etl
+            # contract gap (see SESSION_LOG).
+            import pandas as pd
+
+            pq_path = parquets[0]
+            df = pd.read_parquet(pq_path)
+            date_col_candidates = [c for c in df.columns if c.lower() in {"date", "sasdate"}]
+            date_col = date_col_candidates[0] if date_col_candidates else df.columns[0]
+            series_cols = [c for c in df.columns if c != date_col]
+            df = df.rename(columns={date_col: "sasdate"})
+            df["sasdate"] = pd.to_datetime(df["sasdate"]).dt.strftime("%m/%d/%Y")
+
+            tcode_row = {"sasdate": "Transform:"} | {c: 1 for c in series_cols}
+            out_csv = Path("/tmp/fred_md_synth.csv")
+            with out_csv.open("w") as fh:
+                fh.write(",".join(["sasdate", *series_cols]) + "\n")
+                fh.write(",".join(str(tcode_row[c]) for c in ["sasdate", *series_cols]) + "\n")
+            df[["sasdate", *series_cols]].to_csv(out_csv, mode="a", header=False, index=False)
+            cfg = cfg.model_copy(update={"data_path": str(out_csv)})
+            logger.warning(
+                "Synthesized FRED-MD CSV with tcode=1 for all %d series from %s -> %s",
+                len(series_cols), pq_path, out_csv,
+            )
         else:
-            parquets = sorted(Path(sm_training).rglob("*.parquet"))
-            if parquets:
-                cfg = cfg.model_copy(update={"data_path": str(parquets[0].parent)})
+            csvs = [
+                p
+                for p in sorted(Path(sm_training).rglob("*.csv"))
+                if p.name.lower() != "usrec.csv"
+            ]
+            if csvs:
+                cfg = cfg.model_copy(update={"data_path": str(csvs[0])})
         logger.info("Overriding data_path -> %s", cfg.data_path)
 
     # NBER channel
