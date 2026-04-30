@@ -1,0 +1,46 @@
+# SageMaker AE-only config for B3 -- W6_d7_K4 architecture on the new (B1) split.
+# Re-trains the operational stage-2 winner with TRAIN 1965-99 / VAL 2000-09 / TEST 2010-26
+# so the frozen-NBER mapping has real recession months on VAL (2001 + 2008).
+# Embeddings exported to S3; run scripts/run_clustering_ablation.py afterwards.
+
+seed: 42
+
+# Architecture (W6_d7_K4 winner)
+window_size: 6
+latent_dim: 7
+d_model: 64
+n_heads: 4
+n_layers: 2
+dropout: 0.2
+
+n_clusters: 4
+
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+max_epochs: 200
+patience: 10
+grad_clip: 1.0
+
+pca_variance_threshold: 0.9
+n_pca_max: 5
+
+# Pipeline gate -- AE only (clustering ablation runs locally on exported Z_*.parquet).
+run_clustering: false
+
+# D7 imputation policy (principal: c + a).
+loss_mask_imputed: true
+eval_drop_imputed_target: true
+eval_min_observed_fraction: 0.95
+
+# Data splits -- B1 (1965-99 / 2000-09 / 2010-26).
+train_end: "1999-12-01"
+val_end: "2009-12-01"
+
+data_path: data/raw/fred_md_transformed_balanced_2026_04.parquet
+mask_path: data/raw/fred_md_mask_balanced_2026_04.parquet
+data_format: etl_v2_parquet
+data_sha256: null
+
+nber_usrec_path: data/snapshots/nber_usrec.csv
+explain_top_k: 5

@@ -48,6 +48,15 @@ dev = [
     "pytest-cov>=5.0.0,<6.0.0",
     "ruff>=0.3.0,<0.9.0",
 ]
+# Bayesian non-parametric baselines (sticky/SDHDP-HMM) — local-only, not in SageMaker image.
+# Heavy JAX dependency intentionally isolated from training-time deps.
+baselines = [
+    "dynamax>=0.1.5,<0.2.0",
+    "jax>=0.4.20,<0.5.0",
+    "jaxlib>=0.4.20,<0.5.0",
+    # dynamax pulls fastprogress which imports IPython unconditionally.
+    "ipython>=8.0,<9.0",
+]
 
 
 [tool.pytest.ini_options]

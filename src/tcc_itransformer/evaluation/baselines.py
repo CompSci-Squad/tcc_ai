@@ -132,63 +132,98 @@ def run_all_baselines(
     n_components: int,
     k: int,
     random_state: int = 42,
+    val_windows: np.ndarray | None = None,
 ) -> dict[str, dict]:
     """Run all 4 baselines, return results per baseline.
 
+    Each baseline transform is **fit on train**; KMeans is **fit on the train
+    embedding** and then used to predict labels on val (if provided) and on
+    eval (= test). This is required so the locked 7-metric panel can apply
+    a frozen NBER cluster→regime mapping fit on VAL to TEST.
+
     Returns:
-        ``{name: {'embeddings': np.ndarray, 'labels': np.ndarray, 'silhouette': float}}``
+        ``{name: {
+            'embeddings': np.ndarray (test),
+            'labels': np.ndarray (test),
+            'silhouette': float (test),
+            'val_embeddings': np.ndarray | None,
+            'val_labels': np.ndarray | None,
+        }}``
     """
     results: dict[str, dict] = {}
     n_eval = eval_windows.shape[0]
+    n_val = val_windows.shape[0] if val_windows is not None else 0
 
-    # B0: Random
+    # ---- B0: Random ----
     b0 = RandomEmbeddingBaseline()
-    emb0 = b0.generate(n_eval, n_components, random_state=random_state)
-    km0 = KMeans(n_clusters=k, n_init=20, random_state=random_state)
-    lbl0 = km0.fit_predict(emb0)
+    n_train = train_windows.shape[0]
+    emb0_train = b0.generate(n_train, n_components, random_state=random_state)
+    emb0 = b0.generate(n_eval, n_components, random_state=random_state + 1)
+    km0 = KMeans(n_clusters=k, n_init=20, random_state=random_state).fit(emb0_train)
+    lbl0 = km0.predict(emb0)
+    val0 = b0.generate(n_val, n_components, random_state=random_state + 2) if n_val else None
+    val_lbl0 = km0.predict(val0) if val0 is not None else None
     results["random"] = {
         "embeddings": emb0,
         "labels": lbl0,
-        "silhouette": float(silhouette_score(emb0, lbl0)),
+        "silhouette": float(silhouette_score(emb0, lbl0)) if len(set(lbl0)) > 1 else float("nan"),
+        "val_embeddings": val0,
+        "val_labels": val_lbl0,
     }
 
-    # B1: Raw PCA (treat flattened windows as raw features)
+    # ---- B1: Raw PCA on flattened windows ----
+    flat_train = train_windows.reshape(n_train, -1) if train_windows.ndim == 3 else train_windows
+    flat_eval = eval_windows.reshape(n_eval, -1) if eval_windows.ndim == 3 else eval_windows
+    flat_val = (
+        val_windows.reshape(n_val, -1) if (val_windows is not None and val_windows.ndim == 3) else val_windows
+    )
     b1 = RawPCABaseline()
-    flat_train = train_windows.reshape(train_windows.shape[0], -1) if train_windows.ndim == 3 else train_windows
-    flat_eval = eval_windows.reshape(eval_windows.shape[0], -1) if eval_windows.ndim == 3 else eval_windows
-    b1.fit_transform(flat_train, n_components)
+    emb1_train = b1.fit_transform(flat_train, n_components)
     emb1 = b1.transform(flat_eval)
-    km1 = KMeans(n_clusters=k, n_init=20, random_state=random_state)
-    lbl1 = km1.fit_predict(emb1)
+    km1 = KMeans(n_clusters=k, n_init=20, random_state=random_state).fit(emb1_train)
+    lbl1 = km1.predict(emb1)
+    val1 = b1.transform(flat_val) if flat_val is not None else None
+    val_lbl1 = km1.predict(val1) if val1 is not None else None
     results["raw_pca"] = {
         "embeddings": emb1,
         "labels": lbl1,
-        "silhouette": float(silhouette_score(emb1, lbl1)),
+        "silhouette": float(silhouette_score(emb1, lbl1)) if len(set(lbl1)) > 1 else float("nan"),
+        "val_embeddings": val1,
+        "val_labels": val_lbl1,
     }
 
-    # B2: Linear AE
+    # ---- B2: Linear AE ----
     input_dim = flat_train.shape[1]
     b2 = LinearAEBaseline(input_dim, n_components, random_state=random_state)
     b2.fit(train_windows)
+    emb2_train = b2.transform(train_windows)
     emb2 = b2.transform(eval_windows)
-    km2 = KMeans(n_clusters=k, n_init=20, random_state=random_state)
-    lbl2 = km2.fit_predict(emb2)
+    km2 = KMeans(n_clusters=k, n_init=20, random_state=random_state).fit(emb2_train)
+    lbl2 = km2.predict(emb2)
+    val2 = b2.transform(val_windows) if val_windows is not None else None
+    val_lbl2 = km2.predict(val2) if val2 is not None else None
     results["linear_ae"] = {
         "embeddings": emb2,
         "labels": lbl2,
-        "silhouette": float(silhouette_score(emb2, lbl2)),
+        "silhouette": float(silhouette_score(emb2, lbl2)) if len(set(lbl2)) > 1 else float("nan"),
+        "val_embeddings": val2,
+        "val_labels": val_lbl2,
     }
 
-    # B3: Windowed PCA
+    # ---- B3: Windowed PCA ----
     b3 = WindowedPCABaseline()
-    b3.fit_transform(train_windows, n_components)
+    emb3_train = b3.fit_transform(train_windows, n_components)
     emb3 = b3.transform(eval_windows)
-    km3 = KMeans(n_clusters=k, n_init=20, random_state=random_state)
-    lbl3 = km3.fit_predict(emb3)
+    km3 = KMeans(n_clusters=k, n_init=20, random_state=random_state).fit(emb3_train)
+    lbl3 = km3.predict(emb3)
+    val3 = b3.transform(val_windows) if val_windows is not None else None
+    val_lbl3 = km3.predict(val3) if val3 is not None else None
     results["windowed_pca"] = {
         "embeddings": emb3,
         "labels": lbl3,
-        "silhouette": float(silhouette_score(emb3, lbl3)),
+        "silhouette": float(silhouette_score(emb3, lbl3)) if len(set(lbl3)) > 1 else float("nan"),
+        "val_embeddings": val3,
+        "val_labels": val_lbl3,
     }
 
     return results

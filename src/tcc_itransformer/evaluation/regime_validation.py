@@ -50,6 +50,103 @@ class NBEROverlapResult:
     n_predicted_months: int
 
 
+def _expand_recession(rec: pd.Series, lead: int, lag: int) -> pd.Series:
+    """Tolerance window: recession at t marks [t-lead, t+lag] as positive."""
+    rec_expanded = rec.copy()
+    for k in range(1, lead + 1):
+        rec_expanded = rec_expanded | rec.shift(-k, fill_value=0)
+    for k in range(1, lag + 1):
+        rec_expanded = rec_expanded | rec.shift(k, fill_value=0)
+    return rec_expanded
+
+
+def fit_nber_assignment(
+    val_labels: np.ndarray,
+    val_dates: pd.DatetimeIndex,
+    usrec: pd.Series,
+    *,
+    lead: int = 0,
+    lag: int = 2,
+) -> dict[int, int]:
+    """Fit a frozen cluster→regime mapping on the VALIDATION split.
+
+    Avoids the post-hoc max-F1 selection bias of :func:`nber_overlap`. Each
+    cluster is mapped to 1 (recession) or 0 (expansion) based on the
+    majority of its VAL months that fall inside the tolerance-expanded
+    NBER window. The mapping is returned and must be applied verbatim to
+    the TEST split via :func:`nber_overlap_frozen`.
+
+    Noise points (label ``-1``) are mapped to 0 and excluded from F1.
+
+    Returns:
+        Dict ``{cluster_id: 0 or 1}``.
+    """
+    if len(val_labels) != len(val_dates):
+        raise ValueError("val_labels and val_dates must have same length")
+    s_labels = pd.Series(val_labels, index=pd.DatetimeIndex(val_dates))
+    rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
+    rec_expanded = _expand_recession(rec, lead, lag)
+
+    assignment: dict[int, int] = {}
+    for c in sorted(set(val_labels)):
+        if c == -1:
+            assignment[-1] = 0
+            continue
+        mask = (s_labels == c)
+        if int(mask.sum()) == 0:
+            assignment[int(c)] = 0
+            continue
+        # Majority vote on the tolerance-expanded recession indicator.
+        share_rec = float(rec_expanded[mask].mean())
+        assignment[int(c)] = 1 if share_rec >= 0.5 else 0
+    return assignment
+
+
+def nber_overlap_frozen(
+    labels: np.ndarray,
+    dates: pd.DatetimeIndex,
+    usrec: pd.Series,
+    assignment: dict[int, int],
+    *,
+    lead: int = 0,
+    lag: int = 2,
+) -> NBEROverlapResult:
+    """Apply a frozen cluster→regime mapping (from val) to TEST and score.
+
+    The prediction is the union of all clusters whose ``assignment``
+    value is 1. Clusters absent from ``assignment`` (new on test) are
+    treated as 0. ``matched_cluster`` is set to the *first* cluster
+    flagged as recession, or -1 when none.
+    """
+    if len(labels) != len(dates):
+        raise ValueError("labels and dates must have same length")
+    s_labels = pd.Series(labels, index=pd.DatetimeIndex(dates))
+    rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
+    rec_expanded = _expand_recession(rec, lead, lag)
+
+    pred = s_labels.map(lambda c: int(assignment.get(int(c), 0))).astype(int)
+    n_pred = int(pred.sum())
+    n_rec = int(rec.sum())
+
+    if n_pred == 0 or n_rec == 0:
+        return NBEROverlapResult(0.0, 0.0, 0.0, -1, n_rec, n_pred)
+
+    tp = int(((pred == 1) & (rec_expanded == 1)).sum())
+    precision = tp / n_pred
+    recall = tp / n_rec
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    rec_clusters = sorted(c for c, v in assignment.items() if v == 1 and c != -1)
+    matched = rec_clusters[0] if rec_clusters else -1
+    return NBEROverlapResult(
+        precision=float(precision),
+        recall=float(recall),
+        f1=float(f1),
+        matched_cluster=int(matched),
+        n_recession_months=n_rec,
+        n_predicted_months=n_pred,
+    )
+
+
 def nber_overlap(
     labels: np.ndarray,
     dates: pd.DatetimeIndex,
@@ -58,34 +155,21 @@ def nber_overlap(
     lead: int = 0,
     lag: int = 2,
 ) -> NBEROverlapResult:
-    """Best-cluster overlap with NBER USREC indicator.
+    """Best-cluster overlap with NBER USREC indicator (LEGACY).
 
-    Selects the single cluster whose F1 against USREC is maximal,
-    allowing a [lead, lag] month tolerance window. This handles the
-    publication delay of NBER recession dating.
-
-    Args:
-        labels: Cluster labels for each window timestamp.
-        dates: DatetimeIndex aligned with labels (same length).
-        usrec: 0/1 NBER recession series indexed by month.
-        lead: Months by which a cluster may lead a recession (>=0).
-        lag: Months by which a cluster may lag a recession (>=0).
-
-    Returns:
-        NBEROverlapResult for the cluster with maximal F1.
+    .. deprecated::
+        This metric has post-hoc cluster-selection bias: the best F1 over
+        all clusters is reported, inflating the score. Use
+        :func:`fit_nber_assignment` on VAL plus :func:`nber_overlap_frozen`
+        on TEST instead. Kept for backward compatibility with notebooks
+        and the unit-test fixtures only.
     """
     if len(labels) != len(dates):
         raise ValueError("labels and dates must have same length")
 
     s_labels = pd.Series(labels, index=pd.DatetimeIndex(dates))
     rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
-
-    # Tolerance: expand recession to a window [t-lead, t+lag]
-    rec_expanded = rec.copy()
-    for k in range(1, lead + 1):
-        rec_expanded = rec_expanded | rec.shift(-k, fill_value=0)
-    for k in range(1, lag + 1):
-        rec_expanded = rec_expanded | rec.shift(k, fill_value=0)
+    rec_expanded = _expand_recession(rec, lead, lag)
 
     n_rec = int(rec.sum())
     best = NBEROverlapResult(0.0, 0.0, 0.0, -1, n_rec, 0)

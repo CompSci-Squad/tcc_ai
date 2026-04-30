@@ -13,7 +13,10 @@ from torch.utils.data import DataLoader
 
 from tcc_itransformer.config import ExperimentConfig
 from tcc_itransformer.model.autoencoder import iTransformerAE
-from tcc_itransformer.model.losses import reconstruction_loss
+from tcc_itransformer.model.losses import (
+    masked_reconstruction_loss,
+    reconstruction_loss,
+)
 from tcc_itransformer.training.callbacks import EarlyStopping, ModelCheckpoint
 
 logger = logging.getLogger(__name__)
@@ -69,9 +72,14 @@ class Trainer:
 
         for batch in self.train_loader:
             x = batch[0].to(self.device)
+            mask = batch[1].to(self.device) if len(batch) == 3 else None
             self.optimizer.zero_grad()
             x_hat, _z = self.model(x)
-            loss = reconstruction_loss(x, x_hat)
+            loss = (
+                masked_reconstruction_loss(x, x_hat, mask)
+                if mask is not None
+                else reconstruction_loss(x, x_hat)
+            )
             loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
@@ -92,8 +100,13 @@ class Trainer:
 
         for batch in self.val_loader:
             x = batch[0].to(self.device)
+            mask = batch[1].to(self.device) if len(batch) == 3 else None
             x_hat, _z = self.model(x)
-            loss = reconstruction_loss(x, x_hat)
+            loss = (
+                masked_reconstruction_loss(x, x_hat, mask)
+                if mask is not None
+                else reconstruction_loss(x, x_hat)
+            )
             total_loss += loss.item()
             n_batches += 1
 
@@ -149,7 +162,10 @@ class Trainer:
             dataloader: DataLoader yielding (x, idx) batches.
 
         Returns:
-            Array of shape (n_samples, latent_dim).
+            Array of shape (n_samples, latent_dim). When the dataloader is
+            empty (e.g. D7.a dropped every window of a split), returns a
+            zero-row array of shape (0, latent_dim) and logs a warning rather
+            than raising — downstream code should handle empty splits.
         """
         self.model.eval()
         all_z: list[np.ndarray] = []
@@ -158,6 +174,14 @@ class Trainer:
             x = batch[0].to(self.device)
             z = self.model.encode(x)
             all_z.append(z.cpu().numpy())
+
+        if not all_z:
+            latent_dim = int(self.config.latent_dim)
+            logger.warning(
+                "extract_embeddings: dataloader is empty; returning (0, %d) array",
+                latent_dim,
+            )
+            return np.zeros((0, latent_dim), dtype=np.float32)
 
         return np.concatenate(all_z, axis=0)
 

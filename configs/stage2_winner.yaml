@@ -1,0 +1,56 @@
+seed: 42
+window_size: 6
+latent_dim: 7
+d_model: 64
+n_heads: 4
+n_layers: 2
+dropout: 0.2
+n_clusters: 4
+batch_size: 32
+learning_rate: 0.001
+weight_decay: 0.0001
+max_epochs: 200
+patience: 10
+grad_clip: 1.0
+pca_variance_threshold: 0.9
+n_pca_max: 5
+umap_n_components: 5
+umap_n_neighbors: 15
+umap_min_dist: 0.0
+hdbscan_min_cluster_sizes:
+- 5
+- 8
+- 10
+- 15
+- 20
+hdbscan_min_samples_grid:
+- null
+- 1
+- 5
+hdbscan_max_noise_fraction: 0.5
+run_clustering: false
+nber_usrec_path: data/snapshots/nber_usrec.csv
+explain_top_k: 5
+train_end: "1999-12-01"
+val_end: "2009-12-01"
+data_path: data/snapshots/fred_md_2026_04.csv
+mask_path: null
+results_dir: results
+data_format: fred_md_csv
+data_contract: fred_md_csv_v1
+data_sha256: null
+loss_mask_imputed: true
+eval_drop_imputed_target: true
+eval_min_observed_fraction: 0.95
+drop_imputed_windows: true
+experiment_name: stage2-winner-W6-d7
+_stage2_winner:
+  selected: W6_d7  # tied best_val_loss=0.6272 with W6_d9; d=7 picked for smoother val curve (best_epoch=35 vs 6)
+  job: itransformer-1777575063-0e3d
+  best_val_loss: 0.6272395253181458
+  final_val_loss: 0.6274093389511108
+  best_epoch: 35
+  stopped_epoch: 45
+  source_config: configs/sweep_backfill/W6_d7_K3.yaml
+  auto_picked_alt: W6_d9_K3 (0.6271636, best_epoch=6 — early-peak, less robust)
+  delta_vs_stage1: 0.6306 -> 0.6272 (-0.5%)

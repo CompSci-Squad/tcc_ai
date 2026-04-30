@@ -23,8 +23,12 @@ import sys
 from pathlib import Path
 
 # Add /opt/ml/code to sys.path so `tcc_itransformer` resolves when the source
-# tree is shipped under SAGEMAKER_SUBMIT_DIRECTORY.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+# tree is shipped under SAGEMAKER_SUBMIT_DIRECTORY. Also add the repo root so
+# `scripts.*` (sibling package) is importable when this file is invoked
+# directly as `python sm_jobs/train_entrypoint.py` (local smoke).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO_ROOT / "src"))
+sys.path.insert(0, str(_REPO_ROOT))
 
 import mlflow
 
@@ -71,48 +75,59 @@ def main() -> None:
     # Resolve data path: prefer SM channel mount.
     sm_training = os.environ.get("SM_CHANNEL_TRAINING")
     if sm_training:
-        # Prefer parquet panel; fall back to FRED-MD-format CSV. Skip
-        # USREC.csv if it accidentally lands in the training channel
-        # (it shares the same s3://.../raw/ prefix as the FRED panel).
-        parquets = sorted(Path(sm_training).rglob("*.parquet"))
-        if parquets:
-            # The downstream pipeline (`load_fred_md`) expects FRED-MD CSV
-            # layout: row 1 = headers, row 2 = integer tcodes, row 3+ = data.
-            # tcc_etl currently writes only a *raw* wide parquet (no tcodes),
-            # so synthesize a FRED-MD-format CSV with tcode=1 (level, no
-            # transformation) for every series. This unblocks training but
-            # disables the stationarity step — proper tcodes are a tcc_etl
-            # contract gap (see SESSION_LOG).
-            import pandas as pd
-
-            pq_path = parquets[0]
-            df = pd.read_parquet(pq_path)
-            date_col_candidates = [c for c in df.columns if c.lower() in {"date", "sasdate"}]
-            date_col = date_col_candidates[0] if date_col_candidates else df.columns[0]
-            series_cols = [c for c in df.columns if c != date_col]
-            df = df.rename(columns={date_col: "sasdate"})
-            df["sasdate"] = pd.to_datetime(df["sasdate"]).dt.strftime("%m/%d/%Y")
-
-            tcode_row = {"sasdate": "Transform:"} | {c: 1 for c in series_cols}
-            out_csv = Path("/tmp/fred_md_synth.csv")
-            with out_csv.open("w") as fh:
-                fh.write(",".join(["sasdate", *series_cols]) + "\n")
-                fh.write(",".join(str(tcode_row[c]) for c in ["sasdate", *series_cols]) + "\n")
-            df[["sasdate", *series_cols]].to_csv(out_csv, mode="a", header=False, index=False)
-            cfg = cfg.model_copy(update={"data_path": str(out_csv)})
-            logger.warning(
-                "Synthesized FRED-MD CSV with tcode=1 for all %d series from %s -> %s",
-                len(series_cols), pq_path, out_csv,
+        # ETL v2 contract: prefer fred_md_transformed_balanced_*.parquet +
+        # fred_md_mask_balanced_*.parquet from
+        # s3://tcc-regime-etl-panel-data/fred_md/transformed/year=YYYY/month=MM/.
+        # Fall back to legacy raw parquet (data_format=fred_md_csv) if the
+        # balanced files are absent — but log a loud warning since the AE will
+        # be trained on non-stationary levels in that case.
+        balanced_panels = sorted(Path(sm_training).rglob("*transformed_balanced*.parquet"))
+        balanced_masks = sorted(Path(sm_training).rglob("*mask_balanced*.parquet"))
+        if balanced_panels and balanced_masks:
+            panel_path = balanced_panels[0]
+            mask_path = balanced_masks[0]
+            # Vintage tag from the filename, e.g. fred_md_transformed_balanced_2026_04.parquet
+            vintage = panel_path.stem.split("_")[-2:] if "_" in panel_path.stem else ["unknown"]
+            vintage_tag = "_".join(vintage)
+            cfg = cfg.model_copy(update={
+                "data_path": str(panel_path),
+                "mask_path": str(mask_path),
+                "data_format": "etl_v2_parquet",
+                "data_contract": f"etl_v2_balanced_{vintage_tag}",
+            })
+            logger.info(
+                "Using ETL-v2 contract: panel=%s mask=%s contract=%s",
+                panel_path, mask_path, cfg.data_contract,
             )
         else:
-            csvs = [
-                p
-                for p in sorted(Path(sm_training).rglob("*.csv"))
-                if p.name.lower() != "usrec.csv"
+            # Legacy fallback: any non-balanced parquet, treated as fred_md_csv.
+            parquets = [
+                p for p in sorted(Path(sm_training).rglob("*.parquet"))
+                if "balanced" not in p.name.lower() and "mask" not in p.name.lower()
             ]
-            if csvs:
-                cfg = cfg.model_copy(update={"data_path": str(csvs[0])})
-        logger.info("Overriding data_path -> %s", cfg.data_path)
+            if parquets:
+                logger.warning(
+                    "ETL-v2 balanced parquets not found in %s; falling back to legacy raw "
+                    "parquet %s. The AE will train on non-stationary levels.",
+                    sm_training, parquets[0],
+                )
+                cfg = cfg.model_copy(update={
+                    "data_path": str(parquets[0]),
+                    "data_format": "fred_md_csv",
+                    "data_contract": "legacy_raw_parquet",
+                })
+            else:
+                csvs = [
+                    p for p in sorted(Path(sm_training).rglob("*.csv"))
+                    if p.name.lower() != "usrec.csv"
+                ]
+                if csvs:
+                    cfg = cfg.model_copy(update={
+                        "data_path": str(csvs[0]),
+                        "data_format": "fred_md_csv",
+                        "data_contract": "fred_md_csv_v1",
+                    })
+        logger.info("Resolved data_path=%s data_format=%s", cfg.data_path, cfg.data_format)
 
     # NBER channel
     sm_usrec = os.environ.get("SM_CHANNEL_USREC")
@@ -135,6 +150,25 @@ def main() -> None:
 
     run_name = f"sm_W{cfg.window_size}_d{cfg.latent_dim}_K{cfg.n_clusters}"
     with mlflow.start_run(experiment_id=experiment_id, run_name=run_name):
+        # Lineage tags (Q5 Tier 3) — make every run filterable in MLflow.
+        mlflow.set_tag("data_contract", cfg.data_contract)
+        if cfg.data_sha256:
+            mlflow.set_tag("data_sha256", cfg.data_sha256)
+        mlflow.set_tag("data_format", cfg.data_format)
+        # Best-effort env snapshot (git SHA, package versions, GPU info).
+        try:
+            from scripts.log_environment import get_git_commit, get_gpu_info, get_package_versions
+            mlflow.set_tag("git_sha", get_git_commit())
+            gpu = get_gpu_info()
+            mlflow.set_tag("gpu_available", str(gpu.get("available", False)))
+            pkgs = get_package_versions()
+            if pkgs:
+                env_path = aux_dir / "env_packages.json"
+                env_path.write_text(__import__("json").dumps(pkgs, indent=2, sort_keys=True))
+                mlflow.log_artifact(str(env_path))
+        except Exception:  # pragma: no cover
+            logger.debug("env snapshot failed", exc_info=True)
+
         log_config(cfg)
         # Local import avoids loading torch before sys.path is configured.
         from scripts.run_single import run_full_pipeline  # type: ignore[import-not-found]

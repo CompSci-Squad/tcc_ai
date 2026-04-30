@@ -8,7 +8,11 @@ from tcc_itransformer.model.layers import (
     TransformerEncoderBlock,
     VariateEmbedding,
 )
-from tcc_itransformer.model.losses import naive_baseline_loss, reconstruction_loss
+from tcc_itransformer.model.losses import (
+    masked_reconstruction_loss,
+    naive_baseline_loss,
+    reconstruction_loss,
+)
 
 __all__ = [
     "DecoderFFNBlock",
@@ -17,6 +21,7 @@ __all__ = [
     "iTransformerAE",
     "iTransformerDecoder",
     "iTransformerEncoder",
+    "masked_reconstruction_loss",
     "naive_baseline_loss",
     "reconstruction_loss",
 ]

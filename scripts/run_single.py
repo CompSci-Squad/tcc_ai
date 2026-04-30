@@ -25,6 +25,7 @@ from tcc_itransformer.data.preprocessing import (
     drop_high_nan_series,
     fit_scaler,
     forward_fill_nans,
+    load_etl_v2_panel,
     scale_splits,
     split_by_date,
 )
@@ -48,7 +49,9 @@ from tcc_itransformer.evaluation.explain import (
 from tcc_itransformer.evaluation.regime_validation import (
     bai_perron_alignment,
     crisis_window_coverage,
+    fit_nber_assignment,
     nber_overlap,
+    nber_overlap_frozen,
     regime_conditional_moments,
     regime_durations,
     transition_matrix,
@@ -161,11 +164,31 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     set_global_seed(config.seed)
 
     # --- 2. Data loading & preprocessing ---
-    data, tcodes = load_fred_md(config.data_path)
-    transformed = transform_panel(data, tcodes)
-    cleaned, _dropped = drop_high_nan_series(transformed)
-    filled = forward_fill_nans(cleaned)
-    train_df, val_df, test_df = split_by_date(filled, config.train_end, config.val_end)
+    if config.data_format == "etl_v2_parquet":
+        # Already-transformed-and-imputed parquet from tcc_etl v2.
+        # Skip stationarity/dropna/ffill — ETL did them.
+        panel_df, mask_df = load_etl_v2_panel(
+            config.data_path,
+            config.mask_path,
+            expected_sha256=config.data_sha256,
+        )
+        train_df, val_df, test_df = split_by_date(
+            panel_df, config.train_end, config.val_end,
+        )
+        if mask_df is not None:
+            train_mask_df, val_mask_df, test_mask_df = split_by_date(
+                mask_df, config.train_end, config.val_end,
+            )
+        else:
+            train_mask_df = val_mask_df = test_mask_df = None
+        logger.info("Loaded ETL-v2 panel: %d series, mask=%s", panel_df.shape[1], mask_df is not None)
+    else:
+        data, tcodes = load_fred_md(config.data_path)
+        transformed = transform_panel(data, tcodes)
+        cleaned, _dropped = drop_high_nan_series(transformed)
+        filled = forward_fill_nans(cleaned)
+        train_df, val_df, test_df = split_by_date(filled, config.train_end, config.val_end)
+        train_mask_df = val_mask_df = test_mask_df = None
 
     scaler = fit_scaler(train_df)
     train_scaled, val_scaled, test_scaled = scale_splits(
@@ -177,10 +200,37 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     val_windows = create_windows(val_scaled, config.window_size)
     test_windows = create_windows(test_scaled, config.window_size)
 
+    # Mask windows (D7): same shape as data windows, Boolean.
+    train_mask_w = (
+        create_windows(train_mask_df.to_numpy(dtype=bool), config.window_size)
+        if train_mask_df is not None else None
+    )
+    val_mask_w = (
+        create_windows(val_mask_df.to_numpy(dtype=bool), config.window_size)
+        if val_mask_df is not None else None
+    )
+    test_mask_w = (
+        create_windows(test_mask_df.to_numpy(dtype=bool), config.window_size)
+        if test_mask_df is not None else None
+    )
+
     # --- 3. DataLoaders ---
-    train_ds = FREDMDWindowDataset(train_windows)
-    val_ds = FREDMDWindowDataset(val_windows)
-    test_ds = FREDMDWindowDataset(test_windows)
+    # D7 policy (pre_analysis_plan addendum 2026-04-29):
+    #   train/val: keep all windows, surface mask, use masked MSE in trainer (D7.c).
+    #   test: drop windows whose target row has any imputed cell (D7.a).
+    use_masked_loss = config.loss_mask_imputed and train_mask_w is not None
+    train_ds = FREDMDWindowDataset(
+        train_windows, train_mask_w, drop_imputed=False, return_mask=use_masked_loss,
+    )
+    val_ds = FREDMDWindowDataset(
+        val_windows, val_mask_w, drop_imputed=False, return_mask=use_masked_loss,
+    )
+    test_ds = FREDMDWindowDataset(
+        test_windows, test_mask_w,
+        drop_imputed=config.eval_drop_imputed_target,
+        min_observed_fraction=config.eval_min_observed_fraction,
+        return_mask=False,
+    )
 
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False)
@@ -202,10 +252,14 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     test_emb = trainer.extract_embeddings(test_loader)
 
     # Window-end dates for each split (stride=1 in create_windows).
+    # If D7 mask filter dropped windows, follow the kept_indices.
     W = config.window_size
-    train_emb_dates = pd.DatetimeIndex(train_df.index[W - 1 : W - 1 + len(train_emb)])
-    val_emb_dates = pd.DatetimeIndex(val_df.index[W - 1 : W - 1 + len(val_emb)])
-    test_emb_dates = pd.DatetimeIndex(test_df.index[W - 1 : W - 1 + len(test_emb)])
+    train_all_dates = pd.DatetimeIndex(train_df.index[W - 1 : W - 1 + len(train_windows)])
+    val_all_dates = pd.DatetimeIndex(val_df.index[W - 1 : W - 1 + len(val_windows)])
+    test_all_dates = pd.DatetimeIndex(test_df.index[W - 1 : W - 1 + len(test_windows)])
+    train_emb_dates = train_all_dates[train_ds.kept_indices]
+    val_emb_dates = val_all_dates[val_ds.kept_indices]
+    test_emb_dates = test_all_dates[test_ds.kept_indices]
 
     # Initialise artifacts dict early so embeddings are persisted even if the
     # downstream UMAP+HDBSCAN pipeline raises.
@@ -262,12 +316,27 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
     train_pca = apply_pca(train_emb_no, pca)
 
     # --- 12. TEST set evaluation (non-overlapping) ---
-    test_no_idx = extract_non_overlapping_indices(
-        n_windows=len(test_emb),
-        window_size=config.window_size,
-    )
-    test_emb_no = test_emb[test_no_idx]
-    test_pca = apply_pca(test_emb_no, pca)
+    # When D7.a drops every test window (e.g. the panel tail is fully imputed
+    # for at least one series in every potential target row), test_emb is
+    # empty. We still want the run to complete: train+val embeddings are
+    # exported, and the AE-only metrics block above is intact. Skip
+    # everything that requires a non-empty test set.
+    test_split_empty = len(test_emb) == 0
+    if test_split_empty:
+        logger.warning(
+            "TEST split is empty after D7.a target-row filter; skipping test-side "
+            "PCA/cluster/HDBSCAN evaluation. Train and val embeddings are still exported."
+        )
+        metrics["test_split_empty"] = 1.0
+        test_emb_no = np.zeros((0, train_emb.shape[1]), dtype=train_emb.dtype)
+        test_pca = np.zeros((0, n_pca), dtype=train_pca.dtype)
+    else:
+        test_no_idx = extract_non_overlapping_indices(
+            n_windows=len(test_emb),
+            window_size=config.window_size,
+        )
+        test_emb_no = test_emb[test_no_idx]
+        test_pca = apply_pca(test_emb_no, pca)
 
     # Also val for K selection
     val_no_idx = extract_non_overlapping_indices(
@@ -330,6 +399,7 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
         )
         umap_reducer = fit_umap(train_emb_no, umap_cfg)
         train_umap = apply_umap(train_emb_no, umap_reducer)
+        val_umap = apply_umap(val_emb_no, umap_reducer)
         test_umap = apply_umap(test_emb_no, umap_reducer)
 
         # HDBSCAN with DBCV optimization on TRAIN (no leakage).
@@ -351,6 +421,9 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
             hdb_test_labels, hdb_test_probs = _hdbscan.approximate_predict(
                 hdb_best.clusterer, test_umap,
             )
+            hdb_val_labels, _hdb_val_probs = _hdbscan.approximate_predict(
+                hdb_best.clusterer, val_umap,
+            )
         except Exception:  # pragma: no cover — fall back to refitting on test
             from tcc_itransformer.evaluation.density_clustering import fit_hdbscan
             _refit = fit_hdbscan(
@@ -360,6 +433,12 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
             )
             hdb_test_labels = _refit.labels
             hdb_test_probs = _refit.probabilities
+            _refit_val = fit_hdbscan(
+                val_umap,
+                min_cluster_size=hdb_best.min_cluster_size,
+                min_samples=hdb_best.min_samples,
+            )
+            hdb_val_labels = _refit_val.labels
 
         n_test_clusters = int(len(set(hdb_test_labels)) - (1 if -1 in hdb_test_labels else 0))
         metrics["hdbscan_test_n_clusters"] = float(n_test_clusters)
@@ -380,14 +459,41 @@ def run_experiment(config: ExperimentConfig) -> tuple[dict, dict, dict]:
         hdb_test_labels = np.asarray(hdb_test_labels[:m])
         hdb_test_probs = np.asarray(hdb_test_probs[:m])
 
-        # ---- Layer 2: NBER overlap ----
+        # ---- Layer 2: NBER overlap (Hungarian on VAL, frozen on TEST) ----
+        # Q5 Tier 1 fix: legacy nber_overlap picked the cluster with maximum
+        # F1 on TEST, a textbook post-hoc selection bias. We now fit the
+        # cluster→regime mapping on VAL only and apply it verbatim to TEST.
         try:
             usrec = load_usrec(config.nber_usrec_path)
-            nber_res = nber_overlap(hdb_test_labels, test_window_dates, usrec, lead=0, lag=2)
+            # Recover dates for non-overlapping VAL windows (mirror of TEST).
+            val_dates_all = val_df.index
+            val_window_dates = pd.DatetimeIndex(
+                [
+                    val_dates_all[i * stride_test + config.window_size - 1]
+                    for i in range(len(val_emb_no))
+                    if i * stride_test + config.window_size - 1 < len(val_dates_all)
+                ]
+            )
+            mv = len(val_window_dates)
+            hdb_val_labels = np.asarray(hdb_val_labels[:mv])
+
+            assignment = fit_nber_assignment(
+                hdb_val_labels, val_window_dates, usrec, lead=0, lag=2,
+            )
+            mlflow.set_tag("nber_assignment", str(assignment))
+            nber_res = nber_overlap_frozen(
+                hdb_test_labels, test_window_dates, usrec, assignment,
+                lead=0, lag=2,
+            )
             metrics["nber_f1"] = nber_res.f1
             metrics["nber_precision"] = nber_res.precision
             metrics["nber_recall"] = nber_res.recall
             metrics["nber_matched_cluster"] = float(nber_res.matched_cluster)
+
+            # Also report legacy max-F1 metric explicitly tagged as biased,
+            # so reviewers can compare and the gap is visible in MLflow.
+            legacy = nber_overlap(hdb_test_labels, test_window_dates, usrec, lead=0, lag=2)
+            metrics["nber_f1_legacy_maxF1"] = legacy.f1
         except FileNotFoundError as exc:
             logger.warning("Skipping NBER overlap: %s", exc)
             mlflow.set_tag("nber_status", "snapshot_missing")

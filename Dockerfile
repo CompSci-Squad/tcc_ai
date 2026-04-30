@@ -1,6 +1,8 @@
 # SageMaker training image for tcc_itransformer.
-# Base: AWS Deep Learning Container PyTorch 2.5.1 GPU + Python 3.11.
-FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.5.1-gpu-py311-cu124-ubuntu22.04-sagemaker
+# Base: AWS Deep Learning Container PyTorch 2.9.0 CPU + Python 3.12.
+# CPU-only because Vocareum quota for GPU instances = 0.
+# Tag listed by `aws ecr list-images --registry-id 763104351884 --repository-name pytorch-training`.
+FROM 763104351884.dkr.ecr.us-east-1.amazonaws.com/pytorch-training:2.9.0-cpu-py312-ubuntu22.04-sagemaker-v1.9
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

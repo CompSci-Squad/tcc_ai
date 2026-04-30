@@ -2,13 +2,78 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
+
+
+def file_sha256(path: str | Path, chunk_size: int = 1 << 20) -> str:
+    """SHA-256 of a file's bytes, streamed (no full load).
+
+    Used to verify the ETL-v2 panel that landed inside the SageMaker
+    container matches the one referenced in the ExperimentConfig.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_etl_v2_panel(
+    panel_path: str | Path,
+    mask_path: str | Path | None = None,
+    *,
+    date_column: str = "date",
+    expected_sha256: str | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """Load the ETL-v2 transformed-balanced panel + optional imputation mask.
+
+    The ETL writes wide parquet files with a ``date`` column followed by one
+    column per series. Both panel and mask share the same column set. Panel
+    values are already stationary-transformed (per FRED-MD tcodes), outliers
+    removed, and EM-PCA imputed; the mask is Boolean (True = imputed).
+
+    Args:
+        panel_path: Local path to ``fred_md_transformed_balanced_*.parquet``.
+        mask_path: Optional path to ``fred_md_mask_balanced_*.parquet``.
+        date_column: Column to set as DatetimeIndex.
+        expected_sha256: When provided, raise ``ValueError`` if the panel
+            file's hash does not match. Q5 Tier 3 lineage assertion.
+
+    Returns:
+        Tuple of (panel_df, mask_df). ``mask_df`` is None when mask_path is None.
+    """
+    if expected_sha256:
+        actual = file_sha256(panel_path)
+        if actual != expected_sha256:
+            raise ValueError(
+                f"data_sha256 mismatch for {panel_path}: "
+                f"expected {expected_sha256}, got {actual}. "
+                "Refusing to train on a different dataset than was registered."
+            )
+    panel = pd.read_parquet(panel_path)
+    panel[date_column] = pd.to_datetime(panel[date_column])
+    panel = panel.set_index(date_column).sort_index()
+
+    if mask_path is None:
+        return panel, None
+
+    mask = pd.read_parquet(mask_path)
+    mask[date_column] = pd.to_datetime(mask[date_column])
+    mask = mask.set_index(date_column).sort_index()
+    # Align mask columns to panel; missing -> assume not imputed.
+    mask = mask.reindex(columns=panel.columns, fill_value=False).astype(bool)
+    return panel, mask
 
 
 def drop_high_nan_series(

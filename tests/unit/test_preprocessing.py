@@ -176,6 +176,41 @@ class TestCreateWindows:
         with pytest.raises(ValueError, match="Not enough timesteps"):
             create_windows(data, window_size=12)
 
+    def test_create_windows_is_right_aligned(self) -> None:
+        """Q5 Tier 1 invariant: window i covers ``data[i:i+W]`` and the label
+        timestamp is the LAST row (``data[i+W-1]``) — never the centre and
+        never the first row. Any future refactor that breaks this silently
+        invalidates every NBER/Bai-Perron alignment downstream.
+        """
+        n, w, f = 30, 12, 4
+        # Stamp each row with its global index in column 0 so we can recover
+        # which timesteps each window holds without ambiguity.
+        data = np.zeros((n, f), dtype=float)
+        data[:, 0] = np.arange(n)
+
+        windows = create_windows(data, window_size=w, stride=1)
+        # First window: timesteps [0..11], LAST row is index 11.
+        assert windows[0, 0, 0] == 0.0
+        assert windows[0, -1, 0] == w - 1
+        # Window i must end at row index i + W - 1.
+        for i in range(windows.shape[0]):
+            assert windows[i, -1, 0] == i + w - 1, (
+                f"window {i} not right-aligned: end={windows[i, -1, 0]}, "
+                f"expected {i + w - 1}"
+            )
+            # And start at i (no centring, no future bleed).
+            assert windows[i, 0, 0] == i
+
+    def test_create_windows_non_overlapping_label_dates(self) -> None:
+        """Right-alignment under stride=W (the non-overlapping setting used
+        for embedding extraction in run_single.py). Window i must label
+        timestep ``i*W + W - 1``."""
+        n, w = 48, 12
+        data = np.arange(n, dtype=float).reshape(-1, 1)
+        windows = create_windows(data, window_size=w, stride=w)
+        for i in range(windows.shape[0]):
+            assert windows[i, -1, 0] == i * w + w - 1
+
 
 # ---------------------------------------------------------------------------
 # Tests: FREDMDWindowDataset
@@ -202,3 +237,57 @@ class TestFREDMDWindowDataset:
         x, idx = ds[19]
         assert idx == 19
         assert x.shape == (12, 5)
+
+    def test_min_observed_fraction_keeps_lightly_imputed_rows(self) -> None:
+        # 10 windows, 12 timesteps, 100 features. Target row of window 0 has
+        # 3% imputation (3 cells), window 1 has 10%, window 2 has 0%.
+        rng = np.random.default_rng(0)
+        windows = rng.standard_normal((10, 12, 100)).astype(np.float32)
+        mask = np.zeros_like(windows, dtype=bool)
+        mask[0, -1, :3] = True   # 3% imputed
+        mask[1, -1, :10] = True  # 10% imputed
+        # default min_observed_fraction=0.95 → keeps window 0, drops window 1.
+        ds = FREDMDWindowDataset(
+            windows, mask, drop_imputed=True, min_observed_fraction=0.95,
+        )
+        kept = set(ds.kept_indices.tolist())
+        assert 0 in kept and 2 in kept
+        assert 1 not in kept
+
+    def test_min_observed_fraction_strict_equals_legacy(self) -> None:
+        # min_observed_fraction=1.0 reproduces the strict "any imputed cell rejects" policy.
+        rng = np.random.default_rng(0)
+        windows = rng.standard_normal((5, 6, 4)).astype(np.float32)
+        mask = np.zeros_like(windows, dtype=bool)
+        mask[0, -1, 0] = True
+        mask[3, -1, 2] = True
+        ds = FREDMDWindowDataset(
+            windows, mask, drop_imputed=True, min_observed_fraction=1.0,
+        )
+        assert ds.kept_indices.tolist() == [1, 2, 4]
+
+    def test_return_mask_yields_three_tuple(self) -> None:
+        rng = np.random.default_rng(0)
+        windows = rng.standard_normal((3, 6, 4)).astype(np.float32)
+        mask = np.zeros_like(windows, dtype=bool)
+        mask[0, 2, 1] = True
+        ds = FREDMDWindowDataset(
+            windows, mask, drop_imputed=False, return_mask=True,
+        )
+        x, m, idx = ds[0]
+        assert x.shape == (6, 4)
+        assert m.shape == (6, 4)
+        assert m.dtype == torch.bool
+        assert m[2, 1].item() is True
+        assert idx == 0
+
+    def test_return_mask_requires_mask_windows(self) -> None:
+        windows = np.zeros((2, 3, 4), dtype=np.float32)
+        with pytest.raises(ValueError, match="return_mask=True requires"):
+            FREDMDWindowDataset(windows, return_mask=True)
+
+    def test_invalid_min_observed_fraction_raises(self) -> None:
+        windows = np.zeros((2, 3, 4), dtype=np.float32)
+        mask = np.zeros_like(windows, dtype=bool)
+        with pytest.raises(ValueError, match="min_observed_fraction"):
+            FREDMDWindowDataset(windows, mask, min_observed_fraction=1.5)

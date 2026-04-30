@@ -62,13 +62,53 @@ class ExperimentConfig(BaseModel):
     nber_usrec_path: str = "data/snapshots/nber_usrec.csv"
     explain_top_k: int = Field(default=5, ge=1, le=50)
 
-    # Data splits
-    train_end: str = "2018-12-01"
-    val_end: str = "2021-12-01"
+    # Data splits — re-locked 2026-04-30 (Option C, B1 in panel-remediation-plan).
+    # Previous Option B had VAL=2018-19 (0 NBER recession months) -> NBER F1
+    # structurally undefined on VAL and 0 on TEST (TEST=2020-06+ has 0 recessions
+    # post-mapping window). New split puts both 2001 and 2008 recessions in VAL
+    # so the frozen-NBER mapping has a real signal to fit, and TEST 2010-26
+    # carries 2020 COVID + recovery for honest evaluation.
+    train_end: str = "1999-12-01"
+    val_end: str = "2009-12-01"
 
     # Paths
     data_path: str = "data/snapshots/fred_md_2026_04.csv"
+    mask_path: str | None = None  # ETL v2: path to fred_md_mask_balanced_*.parquet
     results_dir: str = "results"
+
+    # Data contract — selects loader.
+    # - "fred_md_csv": legacy McCracken-Ng FRED-MD CSV (tcodes in row 2). Applies
+    #   transform_panel + drop_high_nan + forward_fill internally.
+    # - "etl_v2_parquet": already-transformed-and-imputed wide parquet from
+    #   tcc_etl v2 (s3://tcc-regime-etl-panel-data/fred_md/transformed/...).
+    #   Skips transform/dropna/ffill. Requires mask_path. Applies D7 window-end
+    #   imputation filter when drop_imputed_windows=True.
+    data_format: Literal["fred_md_csv", "etl_v2_parquet"] = "fred_md_csv"
+    data_contract: str = "fred_md_csv_v1"  # MLflow tag for lineage
+    data_sha256: str | None = None  # Optional content hash for reproducibility
+
+    # D7 imputation policy (pre_analysis_plan.md addendum 2026-04-29).
+    # The principal policy is (c)+(a):
+    #   - loss_mask_imputed=True (D7.c): train/val use the full window set
+    #     and apply masked MSE loss; the AE is graded only on observed cells.
+    #   - eval_drop_imputed_target=True (D7.a): the test split additionally
+    #     drops windows whose target (last) row has any imputed cell, so
+    #     reported test metrics and downstream clustering use only windows
+    #     anchored on a fully observed date.
+    # Robustness appendix (D7.b): set both to False to relax to the legacy
+    # behaviour where imputed cells are treated as observed.
+    loss_mask_imputed: bool = True
+    eval_drop_imputed_target: bool = True
+    # D7.a tolerance: a test window's target row is dropped only when more
+    # than (1 - min_observed_fraction) of its cells are imputed. Default 0.95
+    # tolerates up to 5% imputation per row, which prevents a single
+    # late-publishing series (e.g. CP3M) from invalidating an otherwise
+    # well-observed regime label. Set to 1.0 to recover the strict policy
+    # ("any imputed cell rejects the window"); set to 0.0 to disable filtering.
+    eval_min_observed_fraction: float = 0.95
+    # Deprecated shim — kept only for backward compat with older yamls.
+    # Ignored when loss_mask_imputed/eval_drop_imputed_target are set explicitly.
+    drop_imputed_windows: bool = True
 
     # MLflow
     experiment_name: str = "itransformer-autoencoder"

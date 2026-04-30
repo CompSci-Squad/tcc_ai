@@ -1,4 +1,4 @@
-.PHONY: train sweep test lint ui baselines export install clean download-data generate-sweep help reproduce pull-nber sm-build sm-push sm-train sm-sweep
+.PHONY: train sweep test lint ui baselines hdphmm-baseline export install clean download-data generate-sweep generate-sweep-stage1 generate-sweep-stage2 help reproduce pull-nber sm-build sm-push sm-train sm-train-local sm-sweep sm-sweep-parallel sm-poll
 
 # AWS / SageMaker variables (override on CLI: make sm-build AWS_ACCOUNT=...)
 AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
@@ -6,11 +6,16 @@ AWS_REGION  ?= us-east-1
 ECR_REPO    ?= tcc-regime-etl-itransformer
 IMAGE_TAG   ?= latest
 IMAGE_URI   := $(AWS_ACCOUNT).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPO):$(IMAGE_TAG)
-SM_BUCKET   ?= tcc-regime-etl-sagemaker
-SM_ROLE     ?= arn:aws:iam::$(AWS_ACCOUNT):role/LabRole
-SM_INSTANCE ?= ml.m5.xlarge   # cheap CPU box for AE training (~$0.23/hr); override for sweep
-SM_CONFIG   ?= configs/sagemaker_ae_only.yaml
-MLFLOW_URI  ?=
+SM_BUCKET       ?= tcc-regime-etl-sagemaker
+SM_DATA_BUCKET  ?= tcc-regime-etl-panel-data
+SM_DATA_PREFIX  ?= fred_md/transformed/year=2026/month=04
+SM_ROLE         ?= arn:aws:iam::$(AWS_ACCOUNT):role/LabRole
+# Vocareum Pvoclabs2 (verified 2026-04-30 via simulate-principal-policy) explicitly
+# denies CreateTrainingJob for m4/m6i/m7i/m5.2xlarge+. Allowed CPU: m5.large,
+# m5.xlarge, t3.*, c5.large, c5.xlarge. Use m5.xlarge (4 vCPU / 16GB) for AE.
+SM_INSTANCE     ?= ml.m5.xlarge
+SM_CONFIG       ?= configs/sagemaker_ae_only.yaml
+MLFLOW_URI      ?=
 
 # Install all dependencies
 install:
@@ -24,9 +29,18 @@ download-data:
 pull-nber:
 	uv run python scripts/pull_nber.py
 
-# Generate 36 sweep configuration YAML files
+# Generate 36 sweep configuration YAML files (stage-2: W x d x K).
 generate-sweep:
 	uv run python scripts/generate_sweep_configs.py
+
+# Stage-1 HPO: 12-cell LR x dropout grid at primary (W=12, d_lat=8).
+generate-sweep-stage1:
+	uv run python scripts/generate_sweep_stage1.py
+
+# Stage-2 HPO: regenerate W x d x K configs with frozen stage-1 winner.
+# Usage: make generate-sweep-stage2 STAGE1_WINNER=configs/stage1_winner.yaml
+generate-sweep-stage2:
+	uv run python scripts/generate_sweep_configs.py --frozen-stage1 $(or $(STAGE1_WINNER),configs/stage1_winner.yaml)
 
 # Train a single configuration
 train:
@@ -96,31 +110,110 @@ sm-push: sm-build
 	docker tag $(ECR_REPO):$(IMAGE_TAG) $(IMAGE_URI)
 	docker push $(IMAGE_URI)
 
-# Launch a single SageMaker training job
+# Launch a single SageMaker training job (ETL-v2 contract by default)
 sm-train:
 	uv run python sm_jobs/launch_training.py \
 		--config $(SM_CONFIG) \
 		--bucket $(SM_BUCKET) \
+		--data-bucket $(SM_DATA_BUCKET) \
 		--role $(SM_ROLE) \
 		--region $(AWS_REGION) \
 		--instance-type $(SM_INSTANCE) \
 		--mlflow-uri "$(MLFLOW_URI)" \
 		--image-uri $(IMAGE_URI) \
-		--data-prefix raw \
+		--data-prefix $(SM_DATA_PREFIX) \
 		--usrec-prefix raw/USREC.csv
 
-# Launch one SageMaker job per sweep config (sequential; SM handles parallel slots)
+# Local end-to-end smoke test of the SM entrypoint (no AWS calls).
+# Mounts data via SM_CHANNEL_TRAINING env var pointing at local parquet.
+sm-train-local:
+	SM_CHANNEL_TRAINING=$(PWD)/data/raw \
+	SM_CHANNEL_USREC=$(PWD)/data/snapshots \
+	SM_MODEL_DIR=$(PWD)/results/sm_local/model \
+	SM_OUTPUT_DATA_DIR=$(PWD)/results/sm_local/output \
+	uv run python sm_jobs/train_entrypoint.py --config $(SM_CONFIG)
+
+# Sticky / SDHDP-HMM baseline (Q4). Local CPU JAX. Requires the `baselines` extra:
+#   uv sync --extra baselines
+hdphmm-baseline:
+	uv run python scripts/run_hdphmm_baseline.py \
+		--config $(or $(CONFIG),configs/default.yaml) \
+		--variant $(or $(VARIANT),sticky) \
+		--n-states-max $(or $(N_STATES_MAX),10) \
+		--n-iter $(or $(N_ITER),100)
+
+# Launch one SageMaker job per sweep config (sequential; SM handles parallel slots).
+# Override SM_SWEEP_DIR=configs/sweep_stage1 for the LR×dropout stage.
+SM_SWEEP_DIR    ?= configs/sweep
 sm-sweep:
-	@for cfg in configs/sweep/*.yaml; do \
+	@for cfg in $(SM_SWEEP_DIR)/*.yaml; do \
 		echo "=== Launching $$cfg ==="; \
 		uv run python sm_jobs/launch_training.py \
 			--config $$cfg \
 			--bucket $(SM_BUCKET) \
+			--data-bucket $(SM_DATA_BUCKET) \
 			--role $(SM_ROLE) \
 			--region $(AWS_REGION) \
 			--instance-type $(SM_INSTANCE) \
+			--data-prefix $(SM_DATA_PREFIX) \
+			--usrec-prefix raw/USREC.csv \
 			--mlflow-uri "$(MLFLOW_URI)" \
 			--image-uri $(IMAGE_URI) || exit 1; \
+	done
+
+# Parallel sweep: submit all jobs with bounded concurrency, then poll until all finish.
+# Override MAX_PARALLEL=N (default 4) and SM_SWEEP_DIR.
+# Each submission's stdout/stderr is captured to logs/sm_sweep/<config>.submit.log.
+# Job names are appended to .sm_sweep_jobs.txt for the poll loop.
+# Poll status table is written to logs/sm_sweep/poll.log (tail -f to watch).
+MAX_PARALLEL    ?= 4
+SM_JOBS_FILE    ?= .sm_sweep_jobs.txt
+SM_LOG_DIR      ?= logs/sm_sweep
+sm-sweep-parallel:
+	@mkdir -p $(SM_LOG_DIR)
+	@rm -f $(SM_JOBS_FILE) $(SM_LOG_DIR)/poll.log
+	@n=$$(ls $(SM_SWEEP_DIR)/*.yaml | wc -l); \
+		echo "=== Submitting $$n jobs (max $(MAX_PARALLEL) in flight) ==="; \
+		echo "=== Per-job logs: $(SM_LOG_DIR)/<cfg>.submit.log  Poll log: $(SM_LOG_DIR)/poll.log ==="
+	@ls $(SM_SWEEP_DIR)/*.yaml | xargs -n1 -P $(MAX_PARALLEL) -I {} sh -c '\
+		cfg={} ; \
+		name=$$(basename $$cfg .yaml) ; \
+		log=$(SM_LOG_DIR)/$$name.submit.log ; \
+		uv run python sm_jobs/launch_training.py \
+			--config $$cfg \
+			--bucket $(SM_BUCKET) \
+			--data-bucket $(SM_DATA_BUCKET) \
+			--role $(SM_ROLE) \
+			--region $(AWS_REGION) \
+			--instance-type $(SM_INSTANCE) \
+			--data-prefix $(SM_DATA_PREFIX) \
+			--usrec-prefix raw/USREC.csv \
+			--mlflow-uri "$(MLFLOW_URI)" \
+			--image-uri $(IMAGE_URI) \
+			--no-wait > $$log 2>&1 ; \
+		jn=$$(grep "^JOB_NAME=" $$log | cut -d= -f2) ; \
+		if [ -n "$$jn" ]; then echo "$$jn  $$cfg" >> $(SM_JOBS_FILE) ; echo "submitted: $$jn ($$name)" ; \
+		else echo "FAILED: $$name -> see $$log" ; fi'
+	@echo "=== Submission phase done. Polling every 60s -> $(SM_LOG_DIR)/poll.log ==="
+	@$(MAKE) sm-poll
+
+# Poll all jobs in $(SM_JOBS_FILE) until terminal. Status table -> poll.log; concise summary on stdout.
+sm-poll:
+	@test -s $(SM_JOBS_FILE) || (echo "no jobs in $(SM_JOBS_FILE)"; exit 1)
+	@mkdir -p $(SM_LOG_DIR)
+	@while :; do \
+		pending=0; done_=0; failed=0; \
+		ts=$$(date '+%H:%M:%S'); \
+		printf "\n=== %s ===\n" "$$ts" >> $(SM_LOG_DIR)/poll.log; \
+		for jn in $$(awk '{print $$1}' $(SM_JOBS_FILE)); do \
+			st=$$(aws sagemaker describe-training-job --training-job-name $$jn --region $(AWS_REGION) --no-cli-pager --query TrainingJobStatus --output text 2>/dev/null || echo "Unknown"); \
+			printf "  %-44s %s\n" "$$jn" "$$st" >> $(SM_LOG_DIR)/poll.log; \
+			case "$$st" in Completed) done_=$$((done_+1)) ;; Failed|Stopped) failed=$$((failed+1)) ;; *) pending=$$((pending+1)) ;; esac; \
+		done; \
+		total=$$(wc -l < $(SM_JOBS_FILE)); \
+		printf "[%s] %d/%d done, %d failed, %d running\n" "$$ts" "$$done_" "$$total" "$$failed" "$$pending"; \
+		if [ $$pending -eq 0 ]; then echo "=== all jobs terminal (done=$$done_ failed=$$failed) ==="; break; fi; \
+		sleep 60; \
 	done
 
 # Full reproduction pipeline: download → generate → test → sweep

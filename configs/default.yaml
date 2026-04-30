@@ -26,9 +26,17 @@ grad_clip: 1.0
 pca_variance_threshold: 0.9
 n_pca_max: 5
 
-# Data splits
-train_end: "2018-12-01"
-val_end: "2021-12-01"
+# Data splits — Option B (2026-04-30). COVID lives on TEST, not VAL.
+# Rationale: VAL is the model-selection set; with val_end=2021, March-2020 was
+# an 8–15σ outlier dominating VAL MSE (~16 vs TRAIN ~0.94). New split makes VAL
+# a quiet 24-mo window (2018–2019) and routes COVID to TEST for characterization.
+train_end: "1999-12-01"
+val_end: "2009-12-01"
+
+# D7 imputation policy (principal: c + a) -- see pre_analysis_plan addendum 2026-04-29.
+loss_mask_imputed: true
+eval_drop_imputed_target: true
+eval_min_observed_fraction: 0.95
 
 # Paths
 data_path: "data/snapshots/fred_md_2026_04.csv"

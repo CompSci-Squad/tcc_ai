@@ -30,9 +30,20 @@ n_pca_max: 5
 # Pipeline gate -- AE only.
 run_clustering: false
 
-# Data splits
-train_end: "2018-12-01"
-val_end: "2021-12-01"
+# D7 imputation policy (principal: c + a) -- see pre_analysis_plan addendum 2026-04-29.
+loss_mask_imputed: true        # D7.c: train/val use masked MSE over observed cells only
+eval_drop_imputed_target: true # D7.a: test split drops windows w/ imputed target row
+eval_min_observed_fraction: 0.95  # tolerate up to 5% imputation per target row
+
+# Data splits — COVID lives on TEST, not VAL.
+# Rationale (Option B, 2026-04-30): VAL is the model-selection set (Stage-1/2 HPO
+# pick by VAL MSE; NBER mapping fit on VAL → frozen on TEST). With train_end=2018
+# and val_end=2021, March-2020 (8–15σ outlier under pre-COVID scaler) dominates
+# VAL MSE and would make HPO chase pandemic reconstruction quality. Moving COVID
+# into TEST makes VAL a quiet 24-month window and aligns with the thesis frame:
+# COVID is a regime to *characterize*, not a noise source for selection.
+train_end: "1999-12-01"
+val_end: "2009-12-01"
 
 # Paths (overridden by SM channels at runtime)
 data_path: "data/snapshots/fred_md_2026_04.csv"
