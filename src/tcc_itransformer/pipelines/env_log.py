@@ -1,4 +1,6 @@
-"""Log complete environment information for reproducibility."""
+"""Capture the runtime environment (Python, packages, GPU, git SHA) for reproducibility."""
+
+from __future__ import annotations
 
 import json
 import os
@@ -12,13 +14,10 @@ import torch
 
 
 def get_git_commit() -> str:
-    """Return current git commit hash or 'unknown' if not in a git repo."""
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
+            capture_output=True, text=True, check=True,
         )
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
@@ -26,13 +25,10 @@ def get_git_commit() -> str:
 
 
 def get_package_versions() -> dict[str, str]:
-    """Return installed package versions via uv pip list."""
     try:
         result = subprocess.run(
             ["uv", "pip", "list", "--format=json"],
-            capture_output=True,
-            text=True,
-            check=True,
+            capture_output=True, text=True, check=True,
         )
         packages = json.loads(result.stdout)
         return {pkg["name"]: pkg["version"] for pkg in packages}
@@ -41,10 +37,8 @@ def get_package_versions() -> dict[str, str]:
 
 
 def get_gpu_info() -> dict[str, object]:
-    """Return GPU information from PyTorch CUDA runtime."""
     if not torch.cuda.is_available():
         return {"available": False}
-
     return {
         "available": True,
         "device_count": torch.cuda.device_count(),
@@ -63,7 +57,6 @@ def get_gpu_info() -> dict[str, object]:
 
 
 def collect_environment() -> dict[str, object]:
-    """Collect all environment metadata into a single dictionary."""
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "python_version": sys.version,
@@ -79,23 +72,8 @@ def collect_environment() -> dict[str, object]:
     }
 
 
-def main() -> None:
-    """Collect and save environment information to docs/environment.json."""
+def write_environment(output_path: Path = Path("docs/environment.json")) -> Path:
     env_info = collect_environment()
-
-    output_path = Path("docs/environment.json")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_path, "w") as f:
-        json.dump(env_info, f, indent=2, default=str)
-
-    print(f"Environment logged to {output_path}")
-    print(f"  Python: {env_info['python_version'].split()[0]}")
-    print(f"  PyTorch: {env_info['torch_version']}")
-    gpu_status = "available" if env_info["gpu"]["available"] else "not available"
-    print(f"  GPU: {gpu_status}")
-    print(f"  Git: {env_info['git_commit'][:8]}")
-
-
-if __name__ == "__main__":
-    main()
+    output_path.write_text(json.dumps(env_info, indent=2, default=str))
+    return output_path

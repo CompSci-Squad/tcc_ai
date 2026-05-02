@@ -1,5 +1,5 @@
 # SageMaker AE-only config -- skips UMAP/HDBSCAN/baselines on the GPU/CPU box.
-# Embeddings are exported to S3; run scripts/run_clustering_ablation.py
+# Embeddings are exported to S3; run `tcc eval ablation`
 # afterwards to do the {UMAP, t-SNE} x {KMeans, HDBSCAN} grid on a laptop.
 
 seed: 42

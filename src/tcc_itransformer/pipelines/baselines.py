@@ -1,16 +1,7 @@
-"""Run all 4 baselines for comparison against iTransformer.
-
-For each (W, d_latent, K) from sweep configs, load the same preprocessed data,
-run all baselines on the TEST set with non-overlapping windows, adaptive PCA,
-and log results to MLflow under experiment "baselines".
-
-Usage:
-    python scripts/run_baselines.py --config-dir configs/sweep
-"""
+"""Run all 4 baselines per (W, d, K) cell + locked 7-metric panel CSV."""
 
 from __future__ import annotations
 
-import argparse
 import logging
 from pathlib import Path
 
@@ -30,12 +21,7 @@ from tcc_itransformer.data.preprocessing import (
     split_by_date,
 )
 from tcc_itransformer.evaluation.baselines import run_all_baselines
-from tcc_itransformer.evaluation.clustering import (
-    apply_pca,
-    compute_clustering_metrics,
-    fit_adaptive_pca,
-    fit_kmeans,
-)
+from tcc_itransformer.evaluation.clustering import compute_clustering_metrics
 from tcc_itransformer.evaluation.effective_sample_size import (
     compute_effective_n,
     extract_non_overlapping_indices,
@@ -56,23 +42,7 @@ from tcc_itransformer.tracking.mlflow_utils import (
 logger = logging.getLogger(__name__)
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run baseline comparisons.")
-    parser.add_argument(
-        "--config-dir",
-        type=str,
-        default="configs/sweep",
-        help="Directory containing sweep YAML configs.",
-    )
-    return parser.parse_args()
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-
-    args = parse_args()
-    config_dir = Path(args.config_dir)
-
+def run_baselines(config_dir: Path) -> None:
     if not config_dir.exists():
         logger.error("Config directory %s does not exist.", config_dir)
         return
@@ -81,7 +51,6 @@ def main() -> None:
         ExperimentConfig.from_yaml(p)
         for p in sorted(config_dir.glob("*.yaml"))
     ]
-
     if not configs:
         logger.error("No YAML configs found in %s", config_dir)
         return
@@ -89,11 +58,9 @@ def main() -> None:
     ref_config = configs[0]
     set_global_seed(ref_config.seed)
 
-    # --- Shared data loading ---
     if ref_config.data_format == "etl_v2_parquet":
-        panel_df, _mask_df = load_etl_v2_panel(
-            ref_config.data_path,
-            ref_config.mask_path,
+        panel_df, _mask = load_etl_v2_panel(
+            ref_config.data_path, ref_config.mask_path,
             expected_sha256=ref_config.data_sha256,
         )
         train_df, val_df, test_df = split_by_date(
@@ -102,32 +69,33 @@ def main() -> None:
     else:
         data, tcodes = load_fred_md(ref_config.data_path)
         transformed = transform_panel(data, tcodes)
-        cleaned, _dropped = drop_high_nan_series(transformed)
+        cleaned, _ = drop_high_nan_series(transformed)
         filled = forward_fill_nans(cleaned)
         train_df, val_df, test_df = split_by_date(
             filled, ref_config.train_end, ref_config.val_end,
         )
 
     scaler = fit_scaler(train_df)
-    train_scaled, val_scaled, test_scaled = scale_splits(train_df, val_df, test_df, scaler)
+    train_scaled, val_scaled, test_scaled = scale_splits(
+        train_df, val_df, test_df, scaler,
+    )
 
     tracking_uri = f"file:./{ref_config.results_dir}/mlruns"
     experiment_id = setup_mlflow(tracking_uri, "baselines")
 
     for config in configs:
-        w = config.window_size
-        d = config.latent_dim
-        k = config.n_clusters
+        w, d, k = config.window_size, config.latent_dim, config.n_clusters
 
         train_windows = create_windows(train_scaled, w)
         val_windows = create_windows(val_scaled, w)
         test_windows = create_windows(test_scaled, w)
 
-        # Non-overlapping indices for fair evaluation
-        test_no_idx = extract_non_overlapping_indices(n_windows=len(test_windows), window_size=w)
-        test_windows_no = test_windows[test_no_idx]
-        val_no_idx = extract_non_overlapping_indices(n_windows=len(val_windows), window_size=w)
-        val_windows_no = val_windows[val_no_idx]
+        test_no_idx = extract_non_overlapping_indices(
+            n_windows=len(test_windows), window_size=w,
+        )
+        val_no_idx = extract_non_overlapping_indices(
+            n_windows=len(val_windows), window_size=w,
+        )
         n_eff_test = compute_effective_n(len(test_windows), w)
 
         # Map non-overlapping window indices back to TIMESTAMPS (window-end).
@@ -139,21 +107,15 @@ def main() -> None:
         run_name = f"baseline_W{w}_d{d}_K{k}"
         logger.info("Running baselines: %s (n_eff_test=%d)", run_name, n_eff_test)
 
-        # Use adaptive PCA (same as model pipeline) for fair comparison
         baseline_results = run_all_baselines(
             train_windows=train_windows,
-            eval_windows=test_windows_no,
-            val_windows=val_windows_no,
-            n_components=d,
-            k=k,
-            random_state=config.seed,
+            eval_windows=test_windows[test_no_idx],
+            val_windows=val_windows[val_no_idx],
+            n_components=d, k=k, random_state=config.seed,
         )
 
-        # Locked 7-metric panel CSV (one row per baseline cell).
         usrec_csv = (
-            Path(ref_config.nber_usrec_path)
-            if ref_config.nber_usrec_path
-            else None
+            Path(config.nber_usrec_path) if config.nber_usrec_path else None
         )
         panel_rows: list[dict] = []
         for bname, res in baseline_results.items():
@@ -165,13 +127,11 @@ def main() -> None:
                 Y_test=res["embeddings"],
                 test_signal=res["embeddings"],
                 usrec_csv=usrec_csv,
-                is_density_clusterer=False,  # all 4 baselines = KMeans
+                is_density_clusterer=False,
             )
             panel_rows.append({
                 "baseline": bname,
-                "window_size": w,
-                "latent_dim": d,
-                "n_clusters": k,
+                "window_size": w, "latent_dim": d, "n_clusters": k,
                 "seed": config.seed,
                 **{key: panel.get(key, float("nan")) for key in PANEL_COLUMNS},
                 "nber_precision": panel.get("nber_precision", float("nan")),
@@ -183,7 +143,7 @@ def main() -> None:
                 "test_silhouette": res["silhouette"],
             })
 
-        panel_out_dir = Path(ref_config.results_dir) / "baselines"
+        panel_out_dir = Path(config.results_dir) / "baselines"
         panel_out_dir.mkdir(parents=True, exist_ok=True)
         panel_csv = panel_out_dir / f"baselines_panel_{run_name}.csv"
         pd.DataFrame(panel_rows).to_csv(panel_csv, index=False)
@@ -191,58 +151,54 @@ def main() -> None:
 
         with mlflow.start_run(experiment_id=experiment_id, run_name=run_name):
             mlflow.log_params({
-                "window_size": w,
-                "latent_dim": d,
-                "n_clusters": k,
-                "seed": config.seed,
+                "window_size": w, "latent_dim": d,
+                "n_clusters": k, "seed": config.seed,
             })
-
             if w == 24:
                 mlflow.set_tag("analysis_type", "exploratory")
-                mlflow.set_tag("power_warning", "W=24: n_eff too low for inference")
+                mlflow.set_tag(
+                    "power_warning", "W=24: n_eff too low for inference",
+                )
 
-            metrics: dict[str, float] = {
-                "n_eff_test": float(n_eff_test),
-            }
-            for baseline_name, result in baseline_results.items():
-                metrics[f"{baseline_name}_silhouette"] = result["silhouette"]
-                # Also log full clustering metrics for each baseline
-                bmetrics = compute_clustering_metrics(result["embeddings"], result["labels"])
-                for mname, mval in bmetrics.items():
-                    metrics[f"{baseline_name}_{mname}"] = mval
+            metrics: dict[str, float] = {"n_eff_test": float(n_eff_test)}
+            for bname, result in baseline_results.items():
+                metrics[f"{bname}_silhouette"] = result["silhouette"]
+                bm = compute_clustering_metrics(result["embeddings"], result["labels"])
+                for mname, mval in bm.items():
+                    metrics[f"{bname}_{mname}"] = mval
 
-            # Log the locked 7-metric panel per baseline.
             for prow in panel_rows:
                 bname = prow["baseline"]
                 for pcol in PANEL_COLUMNS:
                     val = prow.get(pcol)
-                    if val is not None and isinstance(val, (int, float)) and not (isinstance(val, float) and np.isnan(val)):
+                    if (
+                        val is not None
+                        and isinstance(val, (int, float))
+                        and not (isinstance(val, float) and np.isnan(val))
+                    ):
                         metrics[f"{bname}_{pcol}"] = float(val)
 
-            # Pairwise permutation tests between baselines
-            baseline_names = list(baseline_results.keys())
-            for i, name_a in enumerate(baseline_names):
-                for name_b in baseline_names[i + 1:]:
-                    res_a = baseline_results[name_a]
-                    res_b = baseline_results[name_b]
-                    if len(res_a["embeddings"]) >= 3 and len(res_b["embeddings"]) >= 3:
+            names = list(baseline_results.keys())
+            for i, na in enumerate(names):
+                for nb in names[i + 1:]:
+                    ra, rb = baseline_results[na], baseline_results[nb]
+                    if len(ra["embeddings"]) >= 3 and len(rb["embeddings"]) >= 3:
                         perm = permutation_test_silhouette(
-                            res_a["embeddings"], res_a["labels"],
-                            res_b["embeddings"], res_b["labels"],
+                            ra["embeddings"], ra["labels"],
+                            rb["embeddings"], rb["labels"],
                             n_permutations=5000, random_state=config.seed,
                         )
-                        metrics[f"perm_{name_a}_vs_{name_b}_delta"] = perm["observed_diff"]
-                        metrics[f"perm_{name_a}_vs_{name_b}_p"] = perm["p_value"]
+                        metrics[f"perm_{na}_vs_{nb}_delta"] = perm["observed_diff"]
+                        metrics[f"perm_{na}_vs_{nb}_p"] = perm["p_value"]
 
             log_evaluation_metrics(metrics)
 
         logger.info(
             "  %s",
-            "  ".join(f"{name}={res['silhouette']:.4f}" for name, res in baseline_results.items()),
+            "  ".join(
+                f"{name}={res['silhouette']:.4f}"
+                for name, res in baseline_results.items()
+            ),
         )
 
     logger.info("All baselines complete.")
-
-
-if __name__ == "__main__":
-    main()

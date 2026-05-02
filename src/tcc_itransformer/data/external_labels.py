@@ -22,7 +22,7 @@ def load_usrec(path: str | Path = DEFAULT_USREC_PATH) -> pd.Series:
     if not path.exists():
         raise FileNotFoundError(
             f"USREC snapshot not found at {path}. "
-            "Run `python scripts/pull_nber.py` first."
+            "Run `tcc data pull-nber` first."
         )
     df = pd.read_csv(path)
     # FRED CSV format: DATE, USREC (or 'observation_date,USREC' on newer exports)

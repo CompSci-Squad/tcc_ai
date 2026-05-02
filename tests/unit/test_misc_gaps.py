@@ -31,12 +31,12 @@ class TestConfigValidation:
 
 
 # ---------------------------------------------------------------------------
-# sha256 helper used by download_data.py / pull_nber.py
+# sha256 helper used by the data-download pipeline.
 # ---------------------------------------------------------------------------
 
 class TestComputeSha256:
     def test_matches_hashlib(self, tmp_path: Path) -> None:
-        from scripts.download_data import compute_sha256
+        from tcc_itransformer.pipelines.data_download import compute_sha256
 
         payload = b"hello FRED-MD\n"
         f = tmp_path / "x.csv"

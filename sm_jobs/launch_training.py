@@ -8,8 +8,7 @@ Usage:
         --instance-type ml.g4dn.xlarge
 
 The Estimator ships the entire `tcc_ai/` directory as the source bundle so
-`scripts/run_single.py` and `src/tcc_itransformer/` are available inside
-the container.
+the `tcc_itransformer` package is importable inside the container.
 """
 
 from __future__ import annotations
@@ -108,7 +107,7 @@ def main() -> None:
     # .venv/, results/, data/, mlruns/, notebooks/, .git/, __pycache__, etc.
     repo_root = Path(__file__).resolve().parent.parent
     staging = Path(tempfile.mkdtemp(prefix="sm-source-"))
-    include_dirs = ["sm_jobs", "src", "scripts", "configs"]
+    include_dirs = ["sm_jobs", "src", "configs"]
     include_files: list[str] = []  # NOTE: do NOT include pyproject.toml — SM toolkit will pip-install it and shadow the entrypoint
     ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".pytest_cache", "*.egg-info")
     for d in include_dirs:

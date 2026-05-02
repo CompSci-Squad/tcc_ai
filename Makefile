@@ -23,36 +23,36 @@ install:
 
 # Download FRED-MD data snapshot with SHA-256 verification
 download-data:
-	uv run python scripts/download_data.py
+	uv run tcc data download
 
 # Pull NBER USREC recession indicator snapshot
 pull-nber:
-	uv run python scripts/pull_nber.py
+	uv run tcc data pull-nber
 
 # Generate 36 sweep configuration YAML files (stage-2: W x d x K).
 generate-sweep:
-	uv run python scripts/generate_sweep_configs.py
+	uv run tcc configs gen-stage2
 
 # Stage-1 HPO: 12-cell LR x dropout grid at primary (W=12, d_lat=8).
 generate-sweep-stage1:
-	uv run python scripts/generate_sweep_stage1.py
+	uv run tcc configs gen-stage1
 
 # Stage-2 HPO: regenerate W x d x K configs with frozen stage-1 winner.
 # Usage: make generate-sweep-stage2 STAGE1_WINNER=configs/stage1_winner.yaml
 generate-sweep-stage2:
-	uv run python scripts/generate_sweep_configs.py --frozen-stage1 $(or $(STAGE1_WINNER),configs/stage1_winner.yaml)
+	uv run tcc configs gen-stage2 --frozen-stage1 $(or $(STAGE1_WINNER),configs/stage1_winner.yaml)
 
 # Train a single configuration
 train:
-	uv run python scripts/run_single.py --config configs/default.yaml
+	uv run tcc train single --config configs/default.yaml
 
 # Run full hyperparameter sweep across all configs
 sweep:
-	uv run python scripts/run_sweep.py
+	uv run tcc train sweep
 
 # Run baseline comparisons (PCA-only, random, etc.)
 baselines:
-	uv run python scripts/run_baselines.py
+	uv run tcc eval baselines
 
 # Run unit tests only
 # Run unit tests only
@@ -69,13 +69,13 @@ test-quality:
 
 # Check code style and formatting
 lint:
-	uv run ruff check src/ tests/ scripts/
-	uv run ruff format --check src/ tests/ scripts/
+	uv run ruff check src/ tests/ sm_jobs/
+	uv run ruff format --check src/ tests/ sm_jobs/
 
 # Auto-fix code style and formatting
 format:
-	uv run ruff check --fix src/ tests/ scripts/
-	uv run ruff format src/ tests/ scripts/
+	uv run ruff check --fix src/ tests/ sm_jobs/
+	uv run ruff format src/ tests/ sm_jobs/
 
 # Launch MLflow UI for experiment tracking
 ui:
@@ -83,11 +83,11 @@ ui:
 
 # Export results to LaTeX tables and figures
 export:
-	uv run python scripts/export_results.py
+	uv run tcc analysis export
 
 # Log environment details (Python version, packages, GPU)
 env-log:
-	uv run python scripts/log_environment.py
+	uv run tcc data env-log
 
 # Remove Python cache files
 clean:
@@ -136,7 +136,7 @@ sm-train-local:
 # Sticky / SDHDP-HMM baseline (Q4). Local CPU JAX. Requires the `baselines` extra:
 #   uv sync --extra baselines
 hdphmm-baseline:
-	uv run python scripts/run_hdphmm_baseline.py \
+	uv run tcc eval hdphmm \
 		--config $(or $(CONFIG),configs/default.yaml) \
 		--variant $(or $(VARIANT),sticky) \
 		--n-states-max $(or $(N_STATES_MAX),10) \

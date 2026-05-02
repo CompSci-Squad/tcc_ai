@@ -22,10 +22,8 @@ import os
 import sys
 from pathlib import Path
 
-# Add /opt/ml/code to sys.path so `tcc_itransformer` resolves when the source
-# tree is shipped under SAGEMAKER_SUBMIT_DIRECTORY. Also add the repo root so
-# `scripts.*` (sibling package) is importable when this file is invoked
-# directly as `python sm_jobs/train_entrypoint.py` (local smoke).
+# Add /opt/ml/code/src to sys.path so `tcc_itransformer` resolves when the
+# source tree is shipped under SAGEMAKER_SUBMIT_DIRECTORY.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO_ROOT / "src"))
 sys.path.insert(0, str(_REPO_ROOT))
@@ -157,7 +155,9 @@ def main() -> None:
         mlflow.set_tag("data_format", cfg.data_format)
         # Best-effort env snapshot (git SHA, package versions, GPU info).
         try:
-            from scripts.log_environment import get_git_commit, get_gpu_info, get_package_versions
+            from tcc_itransformer.pipelines.env_log import (
+                get_git_commit, get_gpu_info, get_package_versions,
+            )
             mlflow.set_tag("git_sha", get_git_commit())
             gpu = get_gpu_info()
             mlflow.set_tag("gpu_available", str(gpu.get("available", False)))
@@ -171,7 +171,7 @@ def main() -> None:
 
         log_config(cfg)
         # Local import avoids loading torch before sys.path is configured.
-        from scripts.run_single import run_full_pipeline  # type: ignore[import-not-found]
+        from tcc_itransformer.pipelines.single import run_full_pipeline
 
         metrics = run_full_pipeline(cfg, model_dir=model_dir, aux_dir=aux_dir)
         log_evaluation_metrics(metrics)

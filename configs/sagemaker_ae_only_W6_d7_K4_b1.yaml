@@ -1,7 +1,7 @@
 # SageMaker AE-only config for B3 -- W6_d7_K4 architecture on the new (B1) split.
 # Re-trains the operational stage-2 winner with TRAIN 1965-99 / VAL 2000-09 / TEST 2010-26
 # so the frozen-NBER mapping has real recession months on VAL (2001 + 2008).
-# Embeddings exported to S3; run scripts/run_clustering_ablation.py afterwards.
+# Embeddings exported to S3; run `tcc eval ablation` afterwards.
 
 seed: 42
 
