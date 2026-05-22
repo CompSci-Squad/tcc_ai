@@ -1,0 +1,55 @@
+{
+  "split_B1": {
+    "train": {
+      "start": "1965-01",
+      "end": "1999-12",
+      "n_total": 1741,
+      "n_recession": 551
+    },
+    "val": {
+      "start": "2000-01",
+      "end": "2009-12",
+      "n_total": 120,
+      "n_recession": 26,
+      "recession_months": [
+        "2001-04",
+        "2001-05",
+        "2001-06",
+        "2001-07",
+        "2001-08",
+        "2001-09",
+        "2001-10",
+        "2001-11",
+        "2008-01",
+        "2008-02",
+        "2008-03",
+        "2008-04",
+        "2008-05",
+        "2008-06",
+        "2008-07",
+        "2008-08",
+        "2008-09",
+        "2008-10",
+        "2008-11",
+        "2008-12",
+        "2009-01",
+        "2009-02",
+        "2009-03",
+        "2009-04",
+        "2009-05",
+        "2009-06"
+      ]
+    },
+    "test": {
+      "start": "2010-01",
+      "end": "2026-04",
+      "n_total": 195,
+      "n_recession": 2,
+      "recession_months": [
+        "2020-03",
+        "2020-04"
+      ]
+    }
+  },
+  "note": "TEST has only 2 recession months (2020-03, 2020-04 \u2014 COVID-19). With lag_tolerance=\u00b12, nber_overlap_frozen can achieve recall=1.0 if the recession cluster covers the Feb-Jun 2020 window. F1 is dominated by precision; high F1 requires cluster not over-extending into expansion."
+}

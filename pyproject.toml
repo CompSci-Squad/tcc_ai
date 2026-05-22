@@ -34,6 +34,7 @@ dependencies = [
     "httpx>=0.28.1",
     "sagemaker>=2.230,<3",
     "typer>=0.12.0,<0.16.0",
+    "ruff>=0.8.6",
 ]
 
 [project.scripts]
@@ -52,6 +53,12 @@ dev = [
     "pytest-cov>=5.0.0,<6.0.0",
     "ruff>=0.3.0,<0.9.0",
 ]
+# External pseudo-label series for multi-label validation panel (Phase C1).
+# Pull RECPROUSM156N, SAHMREALTIME, CFNAIMA3, USALOLITOAASTSAM from FRED.
+labels = [
+    "fredapi>=0.5.0,<0.6.0",
+]
+
 # Bayesian non-parametric baselines (sticky/SDHDP-HMM) — local-only, not in SageMaker image.
 # Heavy JAX dependency intentionally isolated from training-time deps.
 baselines = [
@@ -62,6 +69,21 @@ baselines = [
     "ipython>=8.0,<9.0",
 ]
 
+# Phase E: alternative encoder battery.
+# momentfm PyPI (<=0.1.4) pins transformers==4.33.3 — v0.1.5 on GitHub uses >=4.54.1.
+# Install with: uv sync --extra phase_e
+# MOIRAI (uni2ts) is not on PyPI — install separately after uv sync:
+#   uv run pip install git+https://github.com/SalesforceAIResearch/uni2ts.git
+phase_e = [
+    "momentfm @ git+https://github.com/moment-timeseries-foundation-model/moment.git",
+    "ts2vec>=0.1.0",
+    "transformers>=4.54.1,<5.0.0",
+    "hmmlearn>=0.3.0,<0.4.0",
+]
+
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

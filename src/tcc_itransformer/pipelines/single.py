@@ -656,6 +656,19 @@ def run_single_with_mlflow(config: ExperimentConfig) -> dict:
     run_name = f"W{config.window_size}_d{config.latent_dim}_K{config.n_clusters}"
 
     with mlflow.start_run(experiment_id=experiment_id, run_name=run_name):
+        # Phase D6: lineage tags — injected from env vars when running in
+        # SageMaker or a sweep orchestrator; silently omitted in local runs.
+        import os as _os
+        _LINEAGE_TAGS = [
+            ("stage", "TCC_STAGE"),
+            ("parent_sweep_id", "TCC_SWEEP_ID"),
+            ("aws_job_arn", "SM_TRAINING_JOB_ARN"),
+            ("git_sha", "TCC_GIT_SHA"),
+        ]
+        for _tag_key, _env_key in _LINEAGE_TAGS:
+            _val = _os.environ.get(_env_key)
+            if _val:
+                mlflow.set_tag(_tag_key, _val)
         log_config(config)
         metrics, history, artifacts = run_experiment(config)
         for epoch, (tl, vl) in enumerate(

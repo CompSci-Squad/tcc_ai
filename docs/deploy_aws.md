@@ -6,6 +6,25 @@
 
 ---
 
+## ⚠️ Restrições do ambiente Vocareum / AWS Academy
+
+> **Leia antes de provisionar qualquer coisa.** O sandbox Vocareum impõe restrições que divergem de uma conta AWS normal.
+
+| Restrição | Detalhe |
+|---|---|
+| **IAM** | Somente `arn:aws:iam::207121581830:role/LabRole` é utilizável. Nunca criar novos roles/usuários. |
+| **Instâncias CPU permitidas** | `ml.m5.large`, `ml.m5.xlarge`, `ml.t3.*`, `ml.c5.large`, `ml.c5.xlarge` |
+| **Instâncias bloqueadas** | `ml.m4.*`, `ml.m6i.*`, `ml.m7i.*`, `ml.m5.2xlarge` e maiores — negadas por `simulate-principal-policy` |
+| **Padrão AE training** | `ml.m5.xlarge` (4 vCPU / 16 GB, ~$0,23/hr) |
+| **GPU (opcional)** | `ml.g4dn.xlarge` somente quando explicitamente solicitado |
+| **Limite de custo (Fase E)** | $5 total para todos os encoders alternativos da Fase E |
+| **ECR digest** | Sempre fixar por `@sha256:` digest (ver `make sm-push`; `resolve_image_digest()` em `sm_jobs/launch_training.py`) |
+| **Session tokens** | Tokens Vocareum expiram em ~4h. Se `aws sts get-caller-identity` falhar, re-run `aws configure` ou atualize credenciais no Vocareum. |
+| **Region** | `us-east-1` (obrigatório). Não mude. |
+| **Account** | `207121581830` |
+
+---
+
 ## 0. Visão geral
 
 ```mermaid

@@ -84,9 +84,16 @@ def fit_nber_assignment(
     if len(val_labels) != len(val_dates):
         raise ValueError("val_labels and val_dates must have same length")
     s_labels = pd.Series(val_labels, index=pd.DatetimeIndex(val_dates))
-    rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
-    rec_expanded = _expand_recession(rec, lead, lag)
+    # Expand on the full monthly USREC series FIRST, then reindex to window dates.
+    # Expanding after reindex loses interior recession months that don't land
+    # on a window boundary (e.g., 3-month COVID recession missed by W=6 stride).
+    rec_full_expanded = _expand_recession(usrec.astype(int), lead, lag)
+    rec_expanded = rec_full_expanded.reindex(s_labels.index).fillna(0).astype(int)
 
+    # Base rate of recession across all dates in this split.
+    base_rate = float(rec_expanded.mean()) if len(rec_expanded) > 0 else 0.0
+
+    shares: dict[int, float] = {}
     assignment: dict[int, int] = {}
     for c in sorted(set(val_labels)):
         if c == -1:
@@ -95,10 +102,30 @@ def fit_nber_assignment(
         mask = (s_labels == c)
         if int(mask.sum()) == 0:
             assignment[int(c)] = 0
+            shares[int(c)] = 0.0
             continue
-        # Majority vote on the tolerance-expanded recession indicator.
         share_rec = float(rec_expanded[mask].mean())
-        assignment[int(c)] = 1 if share_rec >= 0.5 else 0
+        shares[int(c)] = share_rec
+
+    # Assign as recession the cluster(s) whose share is both:
+    # (a) highest relative to base rate (enrichment >= 2x) AND
+    # (b) at least 0.05 absolute — avoids assigning recession to noise.
+    # If no cluster passes (b) but one passes (a), use the best cluster only.
+    _ENRICH_FACTOR = 2.0
+    _ABS_MIN = 0.05
+    enriched = {
+        c: s for c, s in shares.items()
+        if s >= max(_ABS_MIN, base_rate * _ENRICH_FACTOR)
+    }
+    if not enriched:
+        # Fall back to the single cluster with max recession share if above base_rate.
+        best_c = max(shares, key=shares.__getitem__) if shares else None
+        if best_c is not None and shares[best_c] > base_rate:
+            enriched = {best_c: shares[best_c]}
+    for c in sorted(set(val_labels)):
+        if c == -1:
+            continue
+        assignment[int(c)] = 1 if int(c) in enriched else 0
     return assignment
 
 
@@ -121,8 +148,9 @@ def nber_overlap_frozen(
     if len(labels) != len(dates):
         raise ValueError("labels and dates must have same length")
     s_labels = pd.Series(labels, index=pd.DatetimeIndex(dates))
+    rec_full_expanded = _expand_recession(usrec.astype(int), lead, lag)
+    rec_expanded = rec_full_expanded.reindex(s_labels.index).fillna(0).astype(int)
     rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
-    rec_expanded = _expand_recession(rec, lead, lag)
 
     pred = s_labels.map(lambda c: int(assignment.get(int(c), 0))).astype(int)
     n_pred = int(pred.sum())
@@ -168,8 +196,9 @@ def nber_overlap(
         raise ValueError("labels and dates must have same length")
 
     s_labels = pd.Series(labels, index=pd.DatetimeIndex(dates))
+    rec_full_expanded = _expand_recession(usrec.astype(int), lead, lag)
+    rec_expanded = rec_full_expanded.reindex(s_labels.index).fillna(0).astype(int)
     rec = usrec.reindex(s_labels.index).fillna(0).astype(int)
-    rec_expanded = _expand_recession(rec, lead, lag)
 
     n_rec = int(rec.sum())
     best = NBEROverlapResult(0.0, 0.0, 0.0, -1, n_rec, 0)
@@ -403,3 +432,137 @@ def regime_durations(labels: np.ndarray) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows).set_index("regime")
+
+
+# =========================================================================== #
+# Phase C1 — Multi-label validation panel
+# =========================================================================== #
+
+def _binarise_label(series: pd.Series, threshold: float, above: bool = True) -> pd.Series:
+    """Convert a continuous indicator to binary using a threshold.
+
+    Args:
+        series: Float indicator aligned to month-start DatetimeIndex.
+        threshold: Decision boundary.
+        above: If True, values >= threshold → 1 (recession). If False, values <= threshold → 1.
+    """
+    if above:
+        return (series >= threshold).astype(int)
+    return (series <= threshold).astype(int)
+
+
+def multi_label_overlap(
+    labels: np.ndarray,
+    dates: pd.DatetimeIndex,
+    label_series_dict: dict[str, pd.Series],
+    assignment: dict[int, int],
+    *,
+    thresholds: dict[str, tuple[float, bool]] | None = None,
+) -> pd.DataFrame:
+    """Compute overlap F1/precision/recall between cluster predictions and multiple external labels.
+
+    For each external label series, the function:
+    1. Binarises the label series using the provided threshold (or default).
+    2. Applies the frozen cluster→recession assignment to get binary predictions.
+    3. Computes precision, recall, F1, and AUC-ROC (when the label is float).
+
+    Args:
+        labels: Array of cluster labels for the evaluation period.
+        dates: DatetimeIndex aligned with ``labels`` (month-start).
+        label_series_dict: Mapping of label_name → raw series (float or binary).
+            Supported names and their defaults:
+              - ``chauvet_piger``: threshold=0.5, above=True
+              - ``sahm``:          threshold=0.5, above=True
+              - ``cfnai_ma3``:     threshold=-0.70, above=False
+              - ``oecd_cli``:      already binary, threshold=0.5, above=True
+        assignment: Frozen cluster→{0,1} mapping from validation set.
+        thresholds: Optional override for (threshold, above) per label name.
+
+    Returns:
+        DataFrame with one row per label and columns:
+            label, precision, recall, f1, auc_roc, n_ref_months, n_pred_months, overlap_months.
+    """
+    _DEFAULT_THRESHOLDS: dict[str, tuple[float, bool]] = {
+        "chauvet_piger": (0.5, True),
+        "sahm": (0.5, True),
+        "cfnai_ma3": (-0.70, False),
+        "oecd_cli": (0.5, True),
+    }
+    th = {**_DEFAULT_THRESHOLDS, **(thresholds or {})}
+
+    s_labels = pd.Series(labels, index=pd.DatetimeIndex(dates))
+    pred_proba = s_labels.map(lambda c: float(assignment.get(int(c), 0))).astype(float)
+
+    rows = []
+    for name, raw_series in label_series_dict.items():
+        threshold, above = th.get(name, (0.5, True))
+
+        ref_bin = _binarise_label(raw_series, threshold, above)
+        ref_aligned = ref_bin.reindex(s_labels.index).fillna(0).astype(int)
+        pred_bin = (pred_proba >= 0.5).astype(int)
+
+        n_ref = int(ref_aligned.sum())
+        n_pred = int(pred_bin.sum())
+        overlap = int(((pred_bin == 1) & (ref_aligned == 1)).sum())
+
+        precision = overlap / n_pred if n_pred > 0 else 0.0
+        recall = overlap / n_ref if n_ref > 0 else 0.0
+        f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+        # AUC-ROC: balanced accuracy = (TPR + TNR) / 2 of the binary cluster prediction.
+        # We use the cluster's binary prediction (pred_bin) as the score, not the raw
+        # indicator series. Using the raw series predicts its own threshold (trivially
+        # perfect or sign-flipped), which is meaningless as a cluster quality measure.
+        auc = float("nan")
+        if n_ref > 0 and n_ref < len(ref_aligned):
+            try:
+                from sklearn.metrics import roc_auc_score
+                auc = float(roc_auc_score(ref_aligned.values, pred_bin.values))
+            except Exception:
+                pass
+
+        rows.append({
+            "label": name,
+            "precision": round(precision, 4),
+            "recall": round(recall, 4),
+            "f1": round(f1, 4),
+            "auc_roc": round(auc, 4) if not (auc != auc) else float("nan"),
+            "n_ref_months": n_ref,
+            "n_pred_months": n_pred,
+            "overlap_months": overlap,
+            "threshold": threshold,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # Majority-vote composite: month is "recession" if ≥2/4 labels agree
+        # (or ≥1/N when fewer labels available)
+        all_refs = []
+        for name, raw_series in label_series_dict.items():
+            threshold, above = th.get(name, (0.5, True))
+            ref_bin = _binarise_label(raw_series, threshold, above)
+            all_refs.append(ref_bin.reindex(s_labels.index).fillna(0).astype(int))
+        if all_refs:
+            vote_stack = pd.concat(all_refs, axis=1)
+            majority_threshold = max(1, len(all_refs) // 2)
+            composite_ref = (vote_stack.sum(axis=1) >= majority_threshold).astype(int)
+            n_ref_c = int(composite_ref.sum())
+            n_pred_c = int(pred_bin.sum())
+            overlap_c = int(((pred_bin == 1) & (composite_ref == 1)).sum())
+            prec_c = overlap_c / n_pred_c if n_pred_c > 0 else 0.0
+            rec_c = overlap_c / n_ref_c if n_ref_c > 0 else 0.0
+            f1_c = (2 * prec_c * rec_c / (prec_c + rec_c)) if (prec_c + rec_c) > 0 else 0.0
+            composite_row = {
+                "label": "composite_majority_vote",
+                "precision": round(prec_c, 4),
+                "recall": round(rec_c, 4),
+                "f1": round(f1_c, 4),
+                "auc_roc": float("nan"),
+                "n_ref_months": n_ref_c,
+                "n_pred_months": n_pred_c,
+                "overlap_months": overlap_c,
+                "threshold": float("nan"),
+            }
+            df = pd.concat([df, pd.DataFrame([composite_row])], ignore_index=True)
+
+    return df

@@ -72,6 +72,18 @@ def data_env_log(
     write_environment(output_path=output)
 
 
+@data_app.command("freeze-config")
+def data_freeze_config(
+    config: Path = typer.Argument(..., help="Config YAML to freeze (e.g. configs/sagemaker_ae_only_W6_d7_K4_b1.yaml)"),
+    data_file: Path | None = typer.Option(None, help="Override data file path (default: read data_path from config)"),
+) -> None:
+    """Compute data SHA-256 and inject it into a .frozen.yaml copy of the config."""
+    _setup_logging()
+    from tcc_itransformer.pipelines.data_download import freeze_config
+    frozen = freeze_config(config, data_file=data_file)
+    typer.echo(f"Frozen config written to: {frozen}")
+
+
 # ============================================================================
 # configs
 # ============================================================================
@@ -203,16 +215,18 @@ def eval_hdphmm(
         "sticky", help="sticky | sdhdp", case_sensitive=False,
     ),
     n_states_max: int = typer.Option(10),
-    n_iter: int = typer.Option(100),
+    n_iter: int = typer.Option(0, help="EM iterations (0=auto: 500 sticky, 200 sdhdp)"),
     mlflow_experiment: str = typer.Option("hdphmm_baseline"),
+    output: Path = typer.Option(None, help="Optional CSV output path for results"),
 ) -> None:
     """Sticky / SDHDP-HMM baseline (requires `--extra baselines`)."""
     _setup_logging()
     from tcc_itransformer.pipelines.hdphmm import run_hdphmm
     run_hdphmm(
         config_path=config, variant=variant.lower(),
-        n_states_max=n_states_max, n_iter=n_iter,
+        n_states_max=n_states_max, n_iter=n_iter if n_iter > 0 else None,
         mlflow_experiment=mlflow_experiment,
+        output=output,
     )
 
 
@@ -252,6 +266,78 @@ def eval_confound(
         embeddings_dir=embeddings_dir, usrec_csv=usrec_csv,
         panel_parquet=panel_parquet, output=output,
         n_pcs=n_pcs, seed=seed,
+    )
+
+
+@eval_app.command("multi-label")
+def eval_multi_label(
+    clustering_parquet: Path = typer.Option(
+        Path("results/clustering_ablation/W6_d7_K4_b1/pca_kmeans.parquet"),
+        help="Clustering result parquet with 'date' and 'label' columns.",
+    ),
+    usrec_csv: Path = typer.Option(Path("data/snapshots/nber_usrec.csv")),
+    output: Path = typer.Option(Path("results/diagnostics/multi_label_panel.csv")),
+    fred_api_key: str = typer.Option("", help="FRED API key (or set FRED_API_KEY env var)"),
+) -> None:
+    """C1 multi-label validation: Chauvet-Piger, Sahm, CFNAI-MA3, OECD CLI."""
+    _setup_logging()
+    from tcc_itransformer.pipelines.multi_label import run_multi_label
+    run_multi_label(
+        clustering_parquet=clustering_parquet,
+        usrec_csv=usrec_csv,
+        output=output,
+        fred_api_key=fred_api_key or None,
+    )
+
+
+@eval_app.command("bai-perron-headline")
+def eval_bai_perron_headline(
+    clustering_parquet: Path = typer.Option(
+        Path("results/clustering_ablation/W6_d7_K4_b1/pca_kmeans.parquet"),
+        help="Clustering result parquet with 'date' and 'label' columns.",
+    ),
+    output: Path = typer.Option(Path("results/diagnostics/bai_perron_headline.csv")),
+    penalty: float = typer.Option(10.0),
+    tolerance: int = typer.Option(3, help="Break-date tolerance in months."),
+    fred_api_key: str = typer.Option("", help="FRED API key (or set FRED_API_KEY env var)"),
+) -> None:
+    """C3 Bai-Perron headline: ruptures on INDPRO/PAYEMS/UNRATE/T10Y3M + Zivot-Andrews."""
+    _setup_logging()
+    from tcc_itransformer.pipelines.bai_perron_headline import run_bai_perron_headline
+    run_bai_perron_headline(
+        clustering_parquet=clustering_parquet,
+        output=output,
+        penalty=penalty,
+        tolerance=tolerance,
+        fred_api_key=fred_api_key or None,
+    )
+
+
+@eval_app.command("cluster-stability")
+def eval_cluster_stability(
+    ablation_dir: Path = typer.Option(
+        Path("results/clustering_ablation/W6_d7_K4_b1"),
+        help="Directory with {pipeline}.parquet files from B1 ablation.",
+    ),
+    emb_dir: Path = typer.Option(
+        Path("results/sm_outputs/itransformer-1777581449-0d38/embeddings"),
+        help="Directory with Z_test.parquet (iTransformer latent embeddings 185×7).",
+    ),
+    output: Path = typer.Option(Path("results/diagnostics/cluster_stability.csv")),
+    n_bootstrap: int = typer.Option(100, help="Number of bootstrap resamples."),
+    resample_frac: float = typer.Option(0.8, help="Fraction of windows per resample."),
+    seed: int = typer.Option(42),
+) -> None:
+    """C4 cluster stability: Ben-Hur 2002 Jaccard + ARI bootstrap per pipeline."""
+    _setup_logging()
+    from tcc_itransformer.pipelines.cluster_stability import run_cluster_stability
+    run_cluster_stability(
+        ablation_dir=ablation_dir,
+        emb_dir=emb_dir,
+        output=output,
+        n_bootstrap=n_bootstrap,
+        resample_frac=resample_frac,
+        seed=seed,
     )
 
 

@@ -113,6 +113,15 @@ class ExperimentConfig(BaseModel):
     # MLflow
     experiment_name: str = "itransformer-autoencoder"
 
+    # Phase D4: winner selection provenance — documents which config was chosen
+    # and why, so the thesis tables are traceable back to the selection criteria.
+    # auto_winner=True means pick by the pre-registered tiebreak rule.
+    # Set override_rationale when overriding the rule (e.g. "smoother embeddings").
+    auto_winner: bool = False
+    operational_winner: str | None = None  # e.g. "W6_d7_K4_b1"
+    override_rationale: str | None = None
+    override_score: float | None = None  # score of the operational winner
+
     @model_validator(mode="after")
     def check_heads_divide_d_model(self) -> Self:
         """Ensure n_heads divides d_model evenly for multi-head attention."""

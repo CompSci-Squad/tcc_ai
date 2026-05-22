@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from pathlib import Path
 
 import httpx
+import yaml
 
 logger = logging.getLogger(__name__)
 
@@ -62,3 +64,45 @@ def download_nber_usrec(output: Path) -> Path:
     sha_path.write_text(f"{digest}  {output.name}\n")
     logger.info("Saved %s (sha256=%s)", output, digest[:16])
     return output
+
+
+def freeze_config(config_path: Path, data_file: Path | None = None) -> Path:
+    """Compute SHA-256 of the data file and inject it into a config YAML.
+
+    Writes a new file alongside the original with a ``.frozen.yaml`` suffix.
+    If *data_file* is not given, the path is read from the config's
+    ``data_path`` field relative to *config_path*'s parent directory.
+
+    Returns the path to the frozen config file.
+    """
+    import re
+
+    with open(config_path) as f:
+        raw = f.read()
+    data = yaml.safe_load(raw)
+
+    if data_file is None:
+        rel = data.get("data_path", "data/snapshots/fred_md_2026_04.csv")
+        # Try relative to config file's directory first, then cwd.
+        candidate = config_path.parent / rel
+        if not candidate.exists():
+            candidate = Path(rel)
+        data_file = candidate
+
+    if not data_file.exists():
+        msg = f"Data file not found: {data_file}"
+        raise FileNotFoundError(msg)
+
+    digest = compute_sha256(data_file)
+    logger.info("SHA-256 of %s: %s", data_file, digest)
+
+    # Inject or replace data_sha256 in the raw YAML text (preserves comments).
+    if "data_sha256:" in raw:
+        raw = re.sub(r"data_sha256:.*", f"data_sha256: {digest}", raw)
+    else:
+        raw = raw.rstrip("\n") + f"\ndata_sha256: {digest}\n"
+
+    frozen_path = config_path.parent / (config_path.stem + ".frozen.yaml")
+    frozen_path.write_text(raw)
+    logger.info("Wrote frozen config: %s", frozen_path)
+    return frozen_path

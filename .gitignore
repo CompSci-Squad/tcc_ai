@@ -1,13 +1,27 @@
-# Data (raw/processed are gitignored, snapshots are committed)
+# ── Data ──────────────────────────────────────────────────────────────────────
+# Raw/processed data are re-downloadable; snapshots (data/snapshots/) are committed
 data/raw/
 data/processed/
 
-# Results artifacts (mlruns metadata is committed, large artifacts are not)
+# ── Results & outputs ─────────────────────────────────────────────────────────
+# Large binary artifacts; reproduced by make train / make eval
 results/mlruns/*/artifacts/
 results/figures/*.png
 results/figures/*.pdf
+results/checkpoints/
+results/sm_outputs/
+results/sm_local/
 
-# Python
+# ── Model weights ─────────────────────────────────────────────────────────────
+*.pt
+*.pth
+*.safetensors
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
@@ -16,48 +30,23 @@ dist/
 build/
 .venv/
 
-# Model checkpoints
-*.pt
-*.pth
-*.safetensors
-checkpoints/
+# ── Tool caches ───────────────────────────────────────────────────────────────
+.ruff_cache/
+.pytest_cache/
+.session/
 
-# IDE
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
-
-# Ruff
-.ruff_cache/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# OS
 .DS_Store
 Thumbs.db
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the entire vscode folder
-# .vscode/
-
-# Ruff stuff:
-.ruff_cache/
-
-# PyPI configuration file
+# ── Packaging ─────────────────────────────────────────────────────────────────
 .pypirc
-
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
 .cursorindexingignore
 
 # Marimo

@@ -1,4 +1,4 @@
-.PHONY: train sweep test lint ui baselines hdphmm-baseline export install clean download-data generate-sweep generate-sweep-stage1 generate-sweep-stage2 help reproduce pull-nber sm-build sm-push sm-train sm-train-local sm-sweep sm-sweep-parallel sm-poll
+.PHONY: train sweep test lint ui baselines hdphmm-baseline export install clean download-data generate-sweep generate-sweep-stage1 generate-sweep-stage2 help reproduce pull-nber sm-build sm-push sm-train sm-train-local sm-sweep sm-sweep-parallel sm-poll multi-label hdphmm-proper bai-perron-headline cluster-stability phase-c freeze-config ablation-aggregate reproduce-thesis phase-e phase-e-fast phase-e-install
 
 # AWS / SageMaker variables (override on CLI: make sm-build AWS_ACCOUNT=...)
 AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
@@ -135,12 +135,61 @@ sm-train-local:
 
 # Sticky / SDHDP-HMM baseline (Q4). Local CPU JAX. Requires the `baselines` extra:
 #   uv sync --extra baselines
+# Phase C2: defaults now 500 iters (sticky) / 200 iters (sdhdp) with winsorisation.
+#   Override with N_ITER=100 to replicate the old collapsed-state result.
 hdphmm-baseline:
 	uv run tcc eval hdphmm \
 		--config $(or $(CONFIG),configs/default.yaml) \
 		--variant $(or $(VARIANT),sticky) \
 		--n-states-max $(or $(N_STATES_MAX),10) \
-		--n-iter $(or $(N_ITER),100)
+		--n-iter $(or $(N_ITER),0)
+
+# ---- Phase C targets ----
+
+# C1: Multi-label validation panel (Chauvet-Piger, Sahm, CFNAI-MA3, OECD CLI).
+# Requires: uv sync --extra labels && export FRED_API_KEY=<key>
+# Override CLUSTERING_PARQUET for other pipelines.
+CLUSTERING_PARQUET ?= results/clustering_ablation/W6_d7_K4_b1/pca_kmeans.parquet
+multi-label:
+	uv run tcc eval multi-label \
+		--clustering-parquet $(CLUSTERING_PARQUET) \
+		--output results/diagnostics/multi_label_panel.csv
+
+# C2: Re-run HDP-HMM baseline with proper n_iter + winsorisation.
+hdphmm-proper:
+	uv sync --extra baselines
+	uv run tcc eval hdphmm \
+		--config $(or $(CONFIG),configs/default.yaml) \
+		--variant sticky \
+		--n-states-max 10 \
+		--n-iter 0
+	uv run tcc eval hdphmm \
+		--config $(or $(CONFIG),configs/default.yaml) \
+		--variant sdhdp \
+		--n-states-max 10 \
+		--n-iter 0
+
+# C3: Bai-Perron break agreement on 4 headline series.
+# Requires: export FRED_API_KEY=<key>
+bai-perron-headline:
+	uv run tcc eval bai-perron-headline \
+		--clustering-parquet $(CLUSTERING_PARQUET) \
+		--output results/diagnostics/bai_perron_headline.csv
+
+# C4: Cluster stability bootstrap (Ben-Hur 2002 Jaccard + ARI).
+# Uses iTransformer Z_test embeddings as the correct feature space.
+EMB_DIR ?= results/sm_outputs/itransformer-1777581449-0d38/embeddings
+cluster-stability:
+	uv run tcc eval cluster-stability \
+		--ablation-dir results/clustering_ablation/W6_d7_K4_b1 \
+		--emb-dir $(EMB_DIR) \
+		--output results/diagnostics/cluster_stability.csv
+
+# Run all Phase C steps (C1+C3 require FRED_API_KEY; C2 requires --extra baselines).
+phase-c: multi-label hdphmm-proper bai-perron-headline cluster-stability
+	@echo "Phase C complete. Results in results/diagnostics/"
+
+.PHONY: multi-label hdphmm-proper bai-perron-headline cluster-stability phase-c
 
 # Launch one SageMaker job per sweep config (sequential; SM handles parallel slots).
 # Override SM_SWEEP_DIR=configs/sweep_stage1 for the LR×dropout stage.
@@ -219,6 +268,46 @@ sm-poll:
 # Full reproduction pipeline: download → generate → test → sweep
 reproduce: clean download-data generate-sweep test sweep
 
+# ---- Phase D targets ----
+
+# D2: Compute data SHA-256 and inject into a .frozen.yaml copy of the config.
+# Usage: make freeze-config CONFIG=configs/sagemaker_ae_only_W6_d7_K4_b1.yaml
+FREEZE_CONFIG ?= configs/sagemaker_ae_only_W6_d7_K4_b1.yaml
+freeze-config:
+	uv run tcc data freeze-config $(FREEZE_CONFIG)
+
+# D3: Aggregate all encoder × downstream results into results/encoders_panel.csv.
+ablation-aggregate:
+	uv run python scripts/aggregate_ablation.py
+
+# D5: Thesis-specific end-to-end reproduction (winner config only, no full sweep).
+# Requires: data snapshots present + clustering ablation results present.
+reproduce-thesis: pull-nber download-data ablation-aggregate phase-c export
+	@echo "=== Thesis reproduction complete. Check results/encoders_panel.csv ==="
+
+# ── Phase E: alternative encoder battery ──────────────────────────────────────
+PHASE_E_ENCODERS ?= moment,ts2vec,patchtst,timesnet,tfc,hamilton_hmm,ms_var,bocpd
+
+# Install optional Phase E Python dependencies.
+# momentfm v0.1.5 (git) is compatible with transformers>=4.54.1 — all encoders in one env.
+# MOIRAI (uni2ts) is not on PyPI — installed separately here.
+phase-e-install:
+	uv sync --extra phase_e
+	uv run pip install git+https://github.com/SalesforceAIResearch/uni2ts.git
+	@echo "Phase E deps installed (momentfm + PatchTST-compatible transformers + MOIRAI)."
+
+# Run full Phase E battery (all encoders, full permutation/bootstrap reps).
+# Prereqs: run `make download-data pull-nber` first if data/raw/ is empty.
+phase-e:
+	uv run python scripts/run_phase_e_encoders.py --encoders $(PHASE_E_ENCODERS)
+	uv run python scripts/aggregate_ablation.py
+	@echo "Phase E complete — see results/phase_e_comparison.csv"
+
+# Quick iteration mode (100 perm/boot reps instead of 1000).
+phase-e-fast:
+	uv run python scripts/run_phase_e_encoders.py --encoders $(PHASE_E_ENCODERS) --fast
+	@echo "Phase E (fast) complete — see results/phase_e_comparison.csv"
+
 # Show available targets
 help:
 	@echo "Available targets:"
@@ -236,6 +325,12 @@ help:
 	@echo "  ui             - Launch MLflow UI"
 	@echo "  export         - Export results to LaTeX"
 	@echo "  reproduce      - Full reproduction pipeline"
+	@echo "  freeze-config  - Inject data SHA-256 into config .frozen.yaml"
+	@echo "  ablation-aggregate - Aggregate all results → results/encoders_panel.csv"
+	@echo "  reproduce-thesis   - Thesis-specific end-to-end reproduction (no full sweep)"
+	@echo "  phase-e-install    - Install Phase E optional deps (momentfm, ts2vec, hmmlearn…)"
+	@echo "  phase-e            - Run Phase E alternative encoder battery (full)"
+	@echo "  phase-e-fast       - Run Phase E with reduced perm/boot reps (dev mode)"
 	@echo "  clean          - Remove cache files"
 	@echo ""
 	@echo "SageMaker:"

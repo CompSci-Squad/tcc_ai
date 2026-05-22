@@ -1,0 +1,10 @@
+exp_id,run_id,run_name,status,val_loss,val_nber_f1,lr,dropout,d_lat,window_size,n_clusters
+541759683262532339,fa5c9a9b,sticky_hdphmm,4,,,?,?,?,12,?
+541759683262532339,ce709f47,sticky_hdphmm,3,,,?,?,?,6,?
+541759683262532339,478e939e,sticky_hdphmm,3,,,?,?,?,6,?
+541759683262532339,475b74a5,sticky_hdphmm,3,,,?,?,?,6,?
+541759683262532339,e2ff4c7a,sticky_hdphmm,3,,,?,?,?,6,?
+541759683262532339,55fd643f,sticky_hdphmm,3,,,?,?,?,6,?
+541759683262532339,9ef0f010,sdhdp_hdphmm,3,,,?,?,?,6,?
+541759683262532339,4d1cc8ac,sdhdp_hdphmm,3,,,?,?,?,6,?
+541759683262532339,9618ae1b,sticky_hdphmm,3,,,?,?,?,6,?
