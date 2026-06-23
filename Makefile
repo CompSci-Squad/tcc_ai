@@ -1,4 +1,4 @@
-.PHONY: train sweep test lint ui baselines hdphmm-baseline export install clean download-data generate-sweep generate-sweep-stage1 generate-sweep-stage2 help reproduce pull-nber sm-build sm-push sm-train sm-train-local sm-sweep sm-sweep-parallel sm-poll multi-label hdphmm-proper bai-perron-headline cluster-stability phase-c freeze-config ablation-aggregate reproduce-thesis phase-e phase-e-fast phase-e-install
+.PHONY: train sweep test lint ui baselines hdphmm-baseline export install clean download-data generate-sweep generate-sweep-stage1 generate-sweep-stage2 help reproduce pull-nber sm-build sm-push sm-train sm-train-local sm-sweep sm-sweep-parallel sm-poll multi-label hdphmm-proper bai-perron-headline cluster-stability phase-c freeze-config ablation-aggregate reproduce-thesis phase-e phase-e-fast phase-e-install sprint1 sprint2 sprint3 sprints sprint4-f2 sprint4-f10 sprint5-f3 sprint6-f4 sprint7-f5 sprints-deferred all-sprints
 
 # AWS / SageMaker variables (override on CLI: make sm-build AWS_ACCOUNT=...)
 AWS_ACCOUNT ?= $(shell aws sts get-caller-identity --query Account --output text 2>/dev/null)
@@ -307,6 +307,59 @@ phase-e:
 phase-e-fast:
 	uv run python scripts/run_phase_e_encoders.py --encoders $(PHASE_E_ENCODERS) --fast
 	@echo "Phase E (fast) complete — see results/phase_e_comparison.csv"
+
+# ── Methodological sprint experiments (F1, F6-F9) ─────────────────────────────
+# Sprint 1 (F1 + F7): MCC/PR-AUC/Brier for all 13 encoders + stress-score ablation
+sprint1:
+	uv run python scripts/sprint1_metrics_and_stress.py
+	@echo "Sprint 1 complete — results/sprint1/"
+
+# Sprint 2 (F8): Consensus clustering on iTransformer embeddings (B=200)
+sprint2:
+	uv run python scripts/sprint2_consensus_clustering.py
+	@echo "Sprint 2 complete — results/sprint2/"
+
+# Sprint 3 (F6 + F9): Macro profiles per cluster + tier-stratified benchmark
+sprint3:
+	uv run python scripts/sprint3_macro_profiles_tiers.py
+	@echo "Sprint 3 complete — results/sprint3/"
+
+# Run all three sprint experiments sequentially
+sprints: sprint1 sprint2 sprint3
+	@echo "All sprints complete."
+
+# Sprint 4 (F2): Bai-Perron breakpoint pre-registration on all 122 FRED-MD series
+sprint4-f2:
+	uv run python scripts/sprint4_f2_bai_perron.py
+	@echo "Sprint 4 F2 complete — results/sprint4/"
+
+# Sprint 4 (F10): Causal inference — Granger causality + VAR IRF/FEVD
+sprint4-f10:
+	uv run python scripts/sprint4_f10_granger.py
+	@echo "Sprint 4 F10 complete — results/sprint4/"
+
+# Sprint 5 (F3): Window sensitivity W∈{3,6,9,12,18,24}
+sprint5-f3:
+	uv run python scripts/sprint5_f3_window_sensitivity.py
+	@echo "Sprint 5 F3 complete — results/sprint5/"
+
+# Sprint 6 (F4): InfoNCE contrastive training vs MSE-only
+sprint6-f4:
+	uv run python scripts/sprint6_f4_infonce.py
+	@echo "Sprint 6 F4 complete — results/sprint6/"
+
+# Sprint 7 (F5): Domain adaptation of Phase E encoders
+sprint7-f5:
+	uv run python scripts/sprint7_f5_domain_adaptation.py
+	@echo "Sprint 7 F5 complete — results/sprint7/"
+
+# Run all deferred fragility experiments (F2, F3, F4, F5, F10)
+sprints-deferred: sprint4-f2 sprint4-f10 sprint5-f3 sprint6-f4 sprint7-f5
+	@echo "All deferred fragility sprints complete."
+
+# Run everything (Sprint 1-3 + deferred F2/F3/F4/F5/F10)
+all-sprints: sprints sprints-deferred
+	@echo "Full sprint suite complete."
 
 # Show available targets
 help:
